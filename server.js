@@ -69,6 +69,11 @@ const clientSchema = new mongoose.Schema({
     venue: { type: String, required: true },
     remark: { type: String },
 }, { timestamps: true });
+
+clientSchema.index({ tenantId: 1, name: 1 });
+clientSchema.index({ tenantId: 1, mobileNumber: 1 });
+clientSchema.index({ tenantId: 1, companyName: 1 });
+
 const Client = mongoose.model('Client', clientSchema);
 
 // Panel plans — base prices with 18% GST included in totalPrice
@@ -1612,6 +1617,9 @@ app.post('/api/clients/bulk-resolve', authenticate, async (req, res) => {
 app.get('/api/clients', authenticate, async (req, res) => {
     try {
         const search = req.query.search?.trim() || '';
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const skip = (page - 1) * limit;
 
         const filter = { tenantId: req.user.tenantId };
         if (search) {
@@ -1622,10 +1630,44 @@ app.get('/api/clients', authenticate, async (req, res) => {
             ];
         }
 
-        const clients = await Client.find(filter).sort({ name: 1 });
+        // Support filtering by groupId
+        if (req.query.groupId) {
+            const group = await Group.findOne({ _id: req.query.groupId, tenantId: req.user.tenantId });
+            if (group) {
+                filter._id = { $in: group.clientIds };
+            } else {
+                return res.json({ clients: [], total: 0, page: 1, totalPages: 0 });
+            }
+        }
 
-        res.json({ clients });
+        // Support filtering by a list of ids
+        if (req.query.ids) {
+            const ids = req.query.ids.split(',').filter(id => id.trim() !== '');
+            filter._id = { $in: ids };
+        }
+
+        // If filtering by groupId or list of ids and no page is explicitly requested, skip pagination
+        const isTargetedQuery = req.query.groupId || req.query.ids;
+        const total = await Client.countDocuments(filter);
+
+        let clients;
+        if (isTargetedQuery && !req.query.page) {
+            clients = await Client.find(filter).sort({ name: 1 });
+        } else {
+            clients = await Client.find(filter)
+                .sort({ name: 1 })
+                .skip(skip)
+                .limit(limit);
+        }
+
+        res.json({
+            clients,
+            total,
+            page,
+            totalPages: Math.ceil(total / limit)
+        });
     } catch (error) {
+        console.error('[server] GET /api/clients error:', error);
         res.status(500).json({ error: 'Failed to fetch clients' });
     }
 });
