@@ -1,0 +1,44 @@
+{
+  "name": "whatsapp_webhook",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "test": "jest --runInBand"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "volta": {
+    "node": "22.22.1"
+  },
+  "dependencies": {
+    "axios": "^1.13.6",
+    "bcrypt": "^6.0.0",
+    "body-parser": "^2.2.2",
+    "cors": "^2.8.6",
+    "crypto": "^1.0.1",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.5.1",
+    "form-data": "^4.0.5",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.3.0",
+    "node-cron": "4.2.1",
+    "nodemailer": "^8.0.1",
+    "razorpay": "^2.9.6",
+    "socket.io": "^4.8.3"
+  },
+  "jest": {
+    "forceExit": true
+  },
+  "devDependencies": {
+    "fast-check": "^4.6.0",
+    "jest": "^30.3.0",
+    "mongodb-memory-server": "^11.0.1",
+    "nodemon": "^3.1.3",
+    "supertest": "^7.2.2"
+  }
+}
