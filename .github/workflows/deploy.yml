@@ -1,0 +1,46 @@
+name: Deploy Backend to aaPanel
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Create deployment package
+        run: |
+          tar --exclude='.git' --exclude='.github' --exclude='node_modules' --exclude='.env' --exclude='*.zip' -czf deploy.tar.gz .
+
+      - name: Copy package to server
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ vars.SSH_HOST }}
+          username: ${{ vars.SSH_USER }}
+          port: ${{ vars.SSH_PORT || 22 }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "deploy.tar.gz"
+          target: ${{ vars.REMOTE_DIR }}
+
+      - name: Extract package and restart PM2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ vars.SSH_HOST }}
+          username: ${{ vars.SSH_USER }}
+          port: ${{ vars.SSH_PORT || 22 }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ${{ vars.REMOTE_DIR }}
+            tar -xzf deploy.tar.gz
+            rm deploy.tar.gz
+            npm install --production
+            if pm2 describe sendzyy-backend > /dev/null; then
+              pm2 reload sendzyy-backend
+            else
+              pm2 start ecosystem.config.js
+            fi
