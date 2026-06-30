@@ -27,3 +27,6 @@ serviceAccountKey.json
 .vscode/
 .idea/
 .history/
+
+# Zip files
+*.zip

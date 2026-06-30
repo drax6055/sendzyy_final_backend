@@ -1541,10 +1541,10 @@ app.post('/api/clients', authenticate, async (req, res) => {
     try {
         const { name, mobileNumber, companyName, emailId, venue, remark } = req.body;
         if (!name || !mobileNumber) return res.status(400).json({ error: 'Name and Mobile Number are required' });
-        if (!venue) return res.status(400).json({ error: 'Venue is required' });
+        const finalVenue = (venue && typeof venue === 'string' && venue.trim() !== '') ? venue.trim() : '-';
         const existing = await Client.findOne({ tenantId: req.user.tenantId, mobileNumber });
         if (existing) return res.status(400).json({ error: 'A client with this mobile number already exists.' });
-        const client = await Client.create({ tenantId: req.user.tenantId, name, mobileNumber, companyName, emailId, venue, remark });
+        const client = await Client.create({ tenantId: req.user.tenantId, name, mobileNumber, companyName, emailId, venue: finalVenue, remark });
         setImmediate(() => evaluateClientTrigger(req.user.tenantId, client).catch(console.error));
         res.status(201).json(client);
     } catch (error) {
@@ -1565,7 +1565,8 @@ app.post('/api/clients/bulk', authenticate, async (req, res) => {
             if (!name || !mobileNumber) { results.skipped.push({ mobileNumber, reason: 'Missing name or mobile' }); continue; }
             const exists = await Client.findOne({ tenantId, mobileNumber });
             if (exists) { results.skipped.push({ mobileNumber, reason: 'Duplicate' }); continue; }
-            const created = await Client.create({ tenantId, name, mobileNumber, companyName, emailId, venue, remark });
+            const finalVenue = (venue && typeof venue === 'string' && venue.trim() !== '') ? venue.trim() : '-';
+            const created = await Client.create({ tenantId, name, mobileNumber, companyName, emailId, venue: finalVenue, remark });
             setImmediate(() => evaluateClientTrigger(tenantId, created).catch(console.error));
             results.imported.push(created);
         }
@@ -1593,13 +1594,14 @@ app.post('/api/clients/bulk-resolve', authenticate, async (req, res) => {
 
             let client = await Client.findOne({ tenantId, mobileNumber });
             if (!client) {
+                const finalVenue = (venue && typeof venue === 'string' && venue.trim() !== '') ? venue.trim() : '-';
                 client = await Client.create({
                     tenantId,
                     name,
                     mobileNumber,
                     companyName,
                     emailId,
-                    venue: venue || 'Bulk Import',
+                    venue: finalVenue,
                     remark
                 });
                 setImmediate(() => evaluateClientTrigger(tenantId, client).catch(console.error));
@@ -2730,25 +2732,38 @@ app.post('/status-mappings', authenticate, async (req, res) => {
 app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
     const { code, appId, wabaId, phoneNumberId } = req.body;
     const tenantId = req.user.tenantId;
-    if (!appId) return res.status(400).json({ error: 'Missing appId' });
+
+    console.log(`[EmbeddedSignup] Request received for tenantId: ${tenantId}`);
+    console.log(`[EmbeddedSignup] Params - appId: ${appId}, wabaId: ${wabaId || 'N/A'}, phoneNumberId: ${phoneNumberId || 'N/A'}, hasCode: ${!!code}`);
+
+    if (!appId) {
+        console.warn(`[EmbeddedSignup] Rejecting: Missing appId`);
+        return res.status(400).json({ error: 'Missing appId' });
+    }
 
     // App secret is kept server-side — never sent from the client
     const appSecret = process.env.META_APP_SECRET;
-    if (!appSecret) return res.status(500).json({ error: 'META_APP_SECRET not configured on server' });
+    if (!appSecret) {
+        console.error(`[EmbeddedSignup] Rejecting: META_APP_SECRET not configured on server`);
+        return res.status(500).json({ error: 'META_APP_SECRET not configured on server' });
+    }
 
     try {
         let accessToken = null;
 
         // Exchange code for access token only if a code was provided
         if (code && code.trim() !== '') {
+            console.log(`[EmbeddedSignup] Exchanging code with Meta Graph API...`);
             const tokenResponse = await axios.get(`https://graph.facebook.com/v25.0/oauth/access_token`, {
                 params: { client_id: appId, client_secret: appSecret, code: code.trim() }
             });
             accessToken = tokenResponse.data.access_token;
+            console.log(`[EmbeddedSignup] Successfully obtained access token (length: ${accessToken ? accessToken.length : 0})`);
         }
 
         // If no token obtained (no code), we cannot proceed — fall back to manual config
         if (!accessToken) {
+            console.warn(`[EmbeddedSignup] No access token was exchanged/provided.`);
             return res.status(400).json({
                 error: 'No auth code received from Meta. Please configure manually.',
                 fallback: true,
@@ -2760,29 +2775,38 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
         let resolvedPhoneNumberId = phoneNumberId || null;
         let resolvedBusinessId = null;
 
+        console.log(`[EmbeddedSignup] Initial IDs - resolvedWabaId: ${resolvedWabaId}, resolvedPhoneNumberId: ${resolvedPhoneNumberId}`);
+
         if (!resolvedWabaId || !resolvedPhoneNumberId) {
+            console.log(`[EmbeddedSignup] Missing IDs. Attempting to auto-fetch from Meta Graph API...`);
             try {
                 // Step 1: correct endpoint for user tokens from Embedded Signup
+                console.log(`[EmbeddedSignup] Step 1: Querying /me/whatsapp_business_accounts`);
                 const wabaRes = await axios.get(`https://graph.facebook.com/v25.0/me/whatsapp_business_accounts`, {
                     params: { access_token: accessToken, fields: 'id,name,business' }
                 });
                 const wabaAccounts = wabaRes.data?.data || [];
+                console.log(`[EmbeddedSignup] Step 1: Found ${wabaAccounts.length} WABA accounts`);
                 if (wabaAccounts.length > 0) {
                     resolvedWabaId = resolvedWabaId || wabaAccounts[0].id;
                     resolvedBusinessId = wabaAccounts[0].business?.id || null;
+                    console.log(`[EmbeddedSignup] Step 1: Resolved WABA ID: ${resolvedWabaId}, Business ID: ${resolvedBusinessId}`);
                 }
             } catch (e1) {
                 console.warn('[EmbeddedSignup] /me/whatsapp_business_accounts failed:', e1.response?.data || e1.message);
                 // Step 2: fallback via /me/businesses
                 try {
+                    console.log(`[EmbeddedSignup] Step 2: Fallback querying /me/businesses`);
                     const bizRes = await axios.get(`https://graph.facebook.com/v25.0/me/businesses`, {
                         params: { access_token: accessToken, fields: 'id,name,owned_whatsapp_business_accounts' }
                     });
+                    console.log(`[EmbeddedSignup] Step 2: Found ${bizRes.data?.data?.length || 0} businesses`);
                     for (const biz of (bizRes.data?.data || [])) {
                         const owned = biz.owned_whatsapp_business_accounts?.data || [];
                         if (owned.length > 0) {
                             resolvedWabaId = resolvedWabaId || owned[0].id;
                             resolvedBusinessId = resolvedBusinessId || biz.id;
+                            console.log(`[EmbeddedSignup] Step 2: Resolved WABA ID: ${resolvedWabaId} via Business: ${biz.id}`);
                             break;
                         }
                     }
@@ -2794,11 +2818,16 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
             // Step 3: fetch phone numbers once we have a WABA ID
             if (resolvedWabaId && !resolvedPhoneNumberId) {
                 try {
+                    console.log(`[EmbeddedSignup] Step 3: Querying phone numbers for WABA ID: ${resolvedWabaId}`);
                     const phoneRes = await axios.get(`https://graph.facebook.com/v25.0/${resolvedWabaId}/phone_numbers`, {
                         params: { access_token: accessToken, fields: 'id,display_phone_number,verified_name' }
                     });
                     const phones = phoneRes.data?.data || [];
-                    if (phones.length > 0) resolvedPhoneNumberId = phones[0].id;
+                    console.log(`[EmbeddedSignup] Step 3: Found ${phones.length} phone numbers`);
+                    if (phones.length > 0) {
+                        resolvedPhoneNumberId = phones[0].id;
+                        console.log(`[EmbeddedSignup] Step 3: Resolved Phone Number ID: ${resolvedPhoneNumberId} (${phones[0].display_phone_number})`);
+                    }
                 } catch (e3) {
                     console.warn('[EmbeddedSignup] phone_numbers fetch failed:', e3.response?.data || e3.message);
                 }
@@ -2814,7 +2843,26 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
         if (resolvedWabaId) updateFields['whatsappConfig.businessAccountId'] = resolvedWabaId;
         if (resolvedPhoneNumberId) updateFields['whatsappConfig.phoneNumberId'] = resolvedPhoneNumberId;
 
-        await Tenant.findByIdAndUpdate(tenantId, updateFields);
+        console.log(`[EmbeddedSignup] Updating Tenant MongoDB document for tenantId: ${tenantId}`);
+        console.log(`[EmbeddedSignup] Fields to update:`, JSON.stringify(updateFields, null, 2));
+
+        const updatedTenant = await Tenant.findByIdAndUpdate(tenantId, updateFields, { new: true });
+        console.log(`[EmbeddedSignup] MongoDB update successful. New config:`, JSON.stringify(updatedTenant?.whatsappConfig, null, 2));
+
+        // Auto-subscribe the WABA to receive webhook events from our app (CRITICAL for Embedded Signup webhooks)
+        if (resolvedWabaId && accessToken) {
+            try {
+                console.log(`[EmbeddedSignup] Registering WABA to receive webhooks from App ${appId}...`);
+                await axios.post(
+                    `https://graph.facebook.com/v25.0/${resolvedWabaId}/subscribed_apps`,
+                    null,
+                    { params: { access_token: accessToken } }
+                );
+                console.log(`[EmbeddedSignup] Automatically subscribed WABA ${resolvedWabaId} to app webhooks`);
+            } catch (subErr) {
+                console.error('[EmbeddedSignup] Failed to auto-subscribe WABA to app webhooks:', subErr.response?.data || subErr.message);
+            }
+        }
 
         res.json({
             success: true,
@@ -2833,6 +2881,7 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
         });
     } catch (error) {
         const errorData = error.response?.data || error.message;
+        console.error(`[EmbeddedSignup] Fatal Error in signup flow:`, errorData);
         res.status(500).json({ error: 'Failed to exchange Meta code for token', details: errorData });
     }
 });
@@ -2897,6 +2946,20 @@ app.post('/refresh-meta-account', authenticate, async (req, res) => {
         if (resolvedPhoneNumberId) updateFields['whatsappConfig.phoneNumberId'] = resolvedPhoneNumberId;
 
         await Tenant.findByIdAndUpdate(tenantId, updateFields);
+
+        // Auto-subscribe/re-subscribe the WABA to receive webhook events (CRITICAL for Embedded Signup webhooks)
+        if (resolvedWabaId && accessToken) {
+            try {
+                await axios.post(
+                    `https://graph.facebook.com/v25.0/${resolvedWabaId}/subscribed_apps`,
+                    null,
+                    { params: { access_token: accessToken } }
+                );
+                console.log(`[RefreshMeta] Automatically subscribed/re-subscribed WABA ${resolvedWabaId} to app webhooks`);
+            } catch (subErr) {
+                console.error('[RefreshMeta] Failed to auto-subscribe WABA to app webhooks:', subErr.response?.data || subErr.message);
+            }
+        }
 
         res.json({
             success: true,
