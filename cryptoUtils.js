@@ -70,4 +70,19 @@ function maskSecret(secret) {
   return '*'.repeat(secret.length - 8) + secret.slice(-8);
 }
 
-module.exports = { encryptSecret, decryptSecret, maskSecret };
+module.exports = { encryptSecret, decryptSecret, maskSecret, generateAppSecretProof };
+
+/**
+ * Generates an HMAC-SHA256 appsecret_proof required by Meta Graph API calls.
+ * This is Step 4 of the Meta WhatsApp Embedded Signup onboarding flow.
+ *
+ * @param {string} systemToken - Your Meta system user access token (META_SYSTEM_TOKEN)
+ * @param {string} appSecret   - Your Meta app secret (META_APP_SECRET)
+ * @returns {string} hex-encoded HMAC-SHA256 digest
+ *
+ * Bash equivalent:
+ *   echo -n "<SYSTEM_TOKEN>" | openssl dgst -sha256 -hmac "<APP_SECRET>"
+ */
+function generateAppSecretProof(systemToken, appSecret) {
+  return crypto.createHmac('sha256', appSecret).update(systemToken).digest('hex');
+}

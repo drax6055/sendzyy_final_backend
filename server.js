@@ -13,6 +13,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const mongoose = require('mongoose');
 require('dotenv').config();
+const { generateAppSecretProof } = require('./cryptoUtils');
 
 //  MongoDB Connection 
 if (process.env.MONGODB_URI) {
@@ -49,10 +50,17 @@ const tenantSchema = new mongoose.Schema({
         lastPaymentDate: Date,
     },
     whatsappConfig: {
-        phoneNumberId: String,
-        accessToken: String,
-        businessAccountId: String,
+        phoneNumberId: String,         // WABA phone number ID (Step 6)
+        accessToken: String,            // Customer business token (Step 5)
+        businessAccountId: String,      // WABA ID (Step 3)
+        businessPortfolioId: String,    // Business Portfolio ID (Step 3 — required for Step 5)
         metaAppId: String,
+        businessId: String,
+        displayPhone: String,           // Human-readable phone e.g. +91 98765 43210 (Step 6)
+        verifiedName: String,           // Business display name (Step 6)
+        qualityRating: String,          // GREEN / YELLOW / RED (Step 6)
+        throughputLevel: String,        // STANDARD / HIGH / NOT_APPLICABLE (Step 6)
+        onboardedAt: Date,              // Timestamp when PARTNER_ADDED webhook fired (Step 3)
         verified: { type: Boolean, default: false },
     },
     webhookSecret: { type: String, default: '' },  // AES-256 encrypted hex string
@@ -373,6 +381,53 @@ const webhookLogSchema = new mongoose.Schema({
     timestamp: { type: Date, default: Date.now, expires: 2592000 }, // TTL 30 days
 });
 const WebhookLog = mongoose.model('WebhookLog', webhookLogSchema);
+
+const onboardingLogSchema = new mongoose.Schema({
+    tenantId: { type: String, default: null },
+    sessionId: { type: String, default: null },
+    wabaId: { type: String, default: null },
+    businessPortfolioId: { type: String, default: null },
+    phoneNumberId: { type: String, default: null },
+    step: { type: String, required: true },
+    status: { type: String, enum: ['info', 'success', 'warning', 'error'], default: 'info' },
+    message: { type: String, required: true },
+    details: { type: mongoose.Schema.Types.Mixed, default: null },
+    timestamp: { type: Date, default: Date.now, expires: 2592000 }, // TTL 30 days
+});
+const OnboardingLog = mongoose.model('OnboardingLog', onboardingLogSchema);
+
+async function saveOnboardingLog({ tenantId, sessionId, wabaId, businessPortfolioId, phoneNumberId, step, status = 'info', message, details }) {
+    try {
+        const log = new OnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId,
+            businessPortfolioId,
+            phoneNumberId,
+            step,
+            status,
+            message,
+            details
+        });
+        
+        // If tenantId is missing but we have wabaId, try to find the tenant to backfill tenantId
+        if (!log.tenantId && wabaId) {
+            const tenant = await Tenant.findOne({ 'whatsappConfig.businessAccountId': wabaId });
+            if (tenant) {
+                log.tenantId = tenant._id.toString();
+            }
+        }
+        
+        await log.save();
+        
+        const prefix = `[Onboarding][${status.toUpperCase()}][${step}]`;
+        const detailsStr = details ? ` | Details: ${JSON.stringify(details)}` : '';
+        console.log(`${prefix} ${message}${detailsStr}`);
+    } catch (err) {
+        console.error(`Failed to save onboarding log:`, err.message);
+    }
+}
+
 
 const groupSchema = new mongoose.Schema({
     tenantId: { type: String, required: true },
@@ -1305,78 +1360,7 @@ app.post('/update-config', authenticate, async (req, res) => {
 
 // Refresh Meta Account — re-fetches WABA ID and Phone Number ID using the stored token.
 // Called when embedded signup completes but IDs were not captured from the JS SDK.
-app.post('/refresh-meta-account', authenticate, async (req, res) => {
-    try {
-        const tenant = await Tenant.findById(req.user.tenantId);
-        if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
-
-        const accessToken = tenant.whatsappConfig?.accessToken;
-        if (!accessToken) return res.status(400).json({ error: 'No access token stored. Connect Meta account first.' });
-
-        let resolvedWabaId = tenant.whatsappConfig?.businessAccountId || null;
-        let resolvedPhoneNumberId = tenant.whatsappConfig?.phoneNumberId || null;
-        let resolvedBusinessId = null;
-
-        // Query Meta Graph API to fill in missing IDs
-        try {
-            const bizResp = await axios.get('https://graph.facebook.com/v25.0/me/businesses', {
-                params: { access_token: accessToken, fields: 'id,name' },
-            });
-            const businesses = bizResp.data?.data || [];
-
-            for (const biz of businesses) {
-                if (resolvedWabaId && resolvedPhoneNumberId) break;
-                resolvedBusinessId = resolvedBusinessId || biz.id;
-
-                const wabaResp = await axios.get(
-                    `https://graph.facebook.com/v25.0/${biz.id}/owned_whatsapp_business_accounts`,
-                    { params: { access_token: accessToken, fields: 'id,name' } }
-                );
-                const wabas = wabaResp.data?.data || [];
-
-                for (const waba of wabas) {
-                    if (!resolvedWabaId) resolvedWabaId = waba.id;
-
-                    const phoneResp = await axios.get(
-                        `https://graph.facebook.com/v25.0/${waba.id}/phone_numbers`,
-                        { params: { access_token: accessToken, fields: 'id,display_phone_number,verified_name' } }
-                    );
-                    const phones = phoneResp.data?.data || [];
-                    if (phones.length > 0 && !resolvedPhoneNumberId) {
-                        resolvedPhoneNumberId = phones[0].id;
-                    }
-                    if (resolvedWabaId && resolvedPhoneNumberId) break;
-                }
-            }
-        } catch (metaErr) {
-            console.error('[refresh-meta] Graph API error:', metaErr.message);
-            return res.status(502).json({ error: 'Failed to fetch data from Meta', details: metaErr.message });
-        }
-
-        // Persist updated IDs
-        const update = {};
-        if (resolvedWabaId) update['whatsappConfig.businessAccountId'] = resolvedWabaId;
-        if (resolvedPhoneNumberId) update['whatsappConfig.phoneNumberId'] = resolvedPhoneNumberId;
-        if (resolvedWabaId && resolvedPhoneNumberId) update['whatsappConfig.verified'] = true;
-
-        if (Object.keys(update).length > 0) {
-            await Tenant.findByIdAndUpdate(req.user.tenantId, update);
-        }
-
-        res.json({
-            success: true,
-            config: {
-                wabaId: resolvedWabaId,
-                phoneNumberId: resolvedPhoneNumberId,
-                businessId: resolvedBusinessId,
-                verified: !!(resolvedWabaId && resolvedPhoneNumberId),
-            },
-        });
-    } catch (err) {
-        console.error('[refresh-meta] Error:', err.message);
-        res.status(500).json({ error: 'Failed to refresh Meta account' });
-    }
-});
+// [Obsolete manual refresh-meta-account route removed to avoid conflicts. Real route is defined below in onboarding routes.]
 
 app.post('/change-password', authenticate, async (req, res) => {
     const { currentPassword, newPassword } = req.body;
@@ -2543,7 +2527,7 @@ app.get('/campaign-analytics', authenticate, async (req, res) => {
         const { businessAccountId, accessToken } = tenant.whatsappConfig;
 
         // Use the Graph API base directly — analytics is a WABA-level endpoint
-        const url = `https://graph.facebook.com/v25.0/${businessAccountId}/analytics`;
+        const url = `${WHATSAPP_API_URL}/${businessAccountId}/analytics`;
 
         const response = await axios.get(url, {
             params: {
@@ -2728,23 +2712,364 @@ app.post('/status-mappings', authenticate, async (req, res) => {
     }
 });
 
-//  Facebook Embedded Signup 
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  META ONBOARDING HELPER — Steps 4 + 5 + 6
+//  Called from:
+//    1. POST /webhook when event === 'PARTNER_ADDED' (Step 3)
+//    2. POST /facebook-embedded-signup as a synchronous fallback when
+//       businessPortfolioId is available from the popup postMessage
+//
+//  @param {string} wabaId              - Customer WhatsApp Business Account ID
+//  @param {string} businessPortfolioId - Customer Business Portfolio ID
+//  @param {string|null} tenantId       - MongoDB _id of the tenant to update
+//                                        (null when called from webhook)
+// ─────────────────────────────────────────────────────────────────────────────
+async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionId = null) {
+    const tag = '[processOnboarding]';
+    const systemToken = process.env.META_SYSTEM_TOKEN;
+    const appSecret   = process.env.META_APP_SECRET;
+    const apiVersion  = process.env.META_API_VERSION || 'v25.0';
+
+    await saveOnboardingLog({
+        tenantId,
+        sessionId,
+        wabaId,
+        businessPortfolioId,
+        step: 'ONBOARDING_PROCESS_START',
+        status: 'info',
+        message: 'processOnboarding task started.'
+    });
+
+    if (!systemToken || systemToken === 'PASTE_YOUR_SYSTEM_USER_TOKEN_HERE') {
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId,
+            businessPortfolioId,
+            step: 'ONBOARDING_PROCESS_SKIPPED_NO_SYSTEM_TOKEN',
+            status: 'warning',
+            message: 'META_SYSTEM_TOKEN is not set on the server environment. Skipping Steps 4-6.'
+        });
+        return null;
+    }
+    if (!businessPortfolioId) {
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId,
+            businessPortfolioId,
+            step: 'ONBOARDING_PROCESS_SKIPPED_NO_PORTFOLIO',
+            status: 'warning',
+            message: 'businessPortfolioId is missing. Cannot fetch permanent system user access token.'
+        });
+        return null;
+    }
+
+    try {
+        // ── Step 4: Generate HMAC-SHA256 appsecret_proof ────────────────────
+        const appSecretProof = generateAppSecretProof(systemToken, appSecret);
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId,
+            businessPortfolioId,
+            step: 'ONBOARDING_PROCESS_HMAC_GEN',
+            status: 'info',
+            message: 'Step 4: HMAC-SHA256 appsecret_proof generated successfully.'
+        });
+
+        // ── Step 5: Get customer business token ─────────────────────────────
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId,
+            businessPortfolioId,
+            step: 'ONBOARDING_PROCESS_FETCH_TOKEN_START',
+            status: 'info',
+            message: `Step 5: Querying customer business system user token for portfolio: ${businessPortfolioId}`
+        });
+        
+        let businessToken = null;
+        try {
+            const tokenRes = await axios.post(
+                `https://graph.facebook.com/${apiVersion}/${businessPortfolioId}/system_user_access_tokens`,
+                new URLSearchParams({
+                    appsecret_proof: appSecretProof,
+                    fetch_only: 'true',
+                }),
+                {
+                    headers: {
+                        'Authorization': `Bearer ${systemToken}`,
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                }
+            );
+            businessToken = tokenRes.data.access_token;
+            
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                wabaId,
+                businessPortfolioId,
+                step: 'ONBOARDING_PROCESS_FETCH_TOKEN_SUCCESS',
+                status: 'success',
+                message: 'Step 5: Permanent business system user access token retrieved successfully.'
+            });
+        } catch (tokenErr) {
+            const tokenErrData = tokenErr.response?.data || tokenErr.message;
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                wabaId,
+                businessPortfolioId,
+                step: 'ONBOARDING_PROCESS_FETCH_TOKEN_FAIL',
+                status: 'error',
+                message: 'Step 5: Fetching business system user access token failed. Falling back to system token.',
+                details: tokenErrData
+            });
+        }
+
+        const tokenForPhoneQuery = businessToken || systemToken;
+
+        // ── Step 6: Get phone number ID from Phone Numbers API ──────────────
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId,
+            businessPortfolioId,
+            step: 'ONBOARDING_PROCESS_FETCH_PHONE_START',
+            status: 'info',
+            message: `Step 6: Querying authoritative phone numbers for WABA ID: ${wabaId}`
+        });
+
+        let phoneNumberId   = null;
+        let displayPhone    = null;
+        let verifiedName    = null;
+        let qualityRating   = null;
+        let throughputLevel = null;
+
+        try {
+            const phoneRes = await axios.get(
+                `https://graph.facebook.com/${apiVersion}/${wabaId}/phone_numbers`,
+                {
+                    params: {
+                        fields: 'id,display_phone_number,verified_name,code_verification_status,quality_rating,platform_type,throughput,last_onboarded_time,webhook_configuration',
+                        access_token: tokenForPhoneQuery,
+                    },
+                }
+            );
+            const phones = phoneRes.data?.data || [];
+            
+            if (phones.length > 0) {
+                const phone    = phones[0];
+                phoneNumberId   = phone.id;
+                displayPhone    = phone.display_phone_number;
+                verifiedName    = phone.verified_name;
+                qualityRating   = phone.quality_rating;
+                throughputLevel = phone.throughput?.level;
+                
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    wabaId,
+                    phoneNumberId,
+                    step: 'ONBOARDING_PROCESS_FETCH_PHONE_SUCCESS',
+                    status: 'success',
+                    message: `Step 6: Phone details fetched successfully: ${displayPhone} (Quality: ${qualityRating || 'N/A'}, Throughput: ${throughputLevel || 'N/A'})`,
+                    details: phone
+                });
+            } else {
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    wabaId,
+                    step: 'ONBOARDING_PROCESS_FETCH_PHONE_EMPTY',
+                    status: 'warning',
+                    message: 'Step 6: No phone numbers found under the registered WABA ID.'
+                });
+            }
+        } catch (phoneErr) {
+            const phoneErrData = phoneErr.response?.data || phoneErr.message;
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                wabaId,
+                step: 'ONBOARDING_PROCESS_FETCH_PHONE_FAIL',
+                status: 'error',
+                message: 'Step 6: Querying phone numbers API failed.',
+                details: phoneErrData
+            });
+        }
+
+        // ── Step 7: Persist to MongoDB ──────────────────────────────────────
+        const updateFields = {
+            'whatsappConfig.businessAccountId':  wabaId,
+            'whatsappConfig.businessPortfolioId': businessPortfolioId,
+            'whatsappConfig.onboardedAt':         new Date(),
+            'whatsappConfig.verified': !!(businessToken && phoneNumberId),
+        };
+        if (businessToken)   updateFields['whatsappConfig.accessToken']    = businessToken;
+        if (phoneNumberId)   updateFields['whatsappConfig.phoneNumberId']   = phoneNumberId;
+        if (displayPhone)    updateFields['whatsappConfig.displayPhone']    = displayPhone;
+        if (verifiedName)    updateFields['whatsappConfig.verifiedName']    = verifiedName;
+        if (qualityRating)   updateFields['whatsappConfig.qualityRating']   = qualityRating;
+        if (throughputLevel) updateFields['whatsappConfig.throughputLevel'] = throughputLevel;
+
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId,
+            businessPortfolioId,
+            phoneNumberId,
+            step: 'ONBOARDING_PROCESS_DB_SAVE_START',
+            status: 'info',
+            message: 'Step 7: Persisting finalized onboarding variables to MongoDB...',
+            details: updateFields
+        });
+
+        let updatedTenant = null;
+        if (tenantId) {
+            updatedTenant = await Tenant.findByIdAndUpdate(
+                tenantId,
+                { $set: updateFields },
+                { new: true }
+            );
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                wabaId,
+                step: 'ONBOARDING_PROCESS_DB_SAVE_SUCCESS',
+                status: 'success',
+                message: `Step 7: Successfully updated tenant config for tenant ID: ${tenantId}`,
+                details: updatedTenant?.whatsappConfig
+            });
+        } else {
+            updatedTenant = await Tenant.findOneAndUpdate(
+                { 'whatsappConfig.businessAccountId': wabaId },
+                { $set: updateFields },
+                { new: true }
+            );
+            if (updatedTenant) {
+                await saveOnboardingLog({
+                    tenantId: updatedTenant._id.toString(),
+                    sessionId,
+                    wabaId,
+                    step: 'ONBOARDING_PROCESS_DB_SAVE_SUCCESS',
+                    status: 'success',
+                    message: `Step 7: Found tenant by WABA ID and updated successfully.`,
+                    details: updatedTenant?.whatsappConfig
+                });
+            } else {
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    wabaId,
+                    step: 'ONBOARDING_PROCESS_DB_SAVE_NOTFOUND',
+                    status: 'warning',
+                    message: `Step 7: No active tenant document found matching WABA ID: ${wabaId}`
+                });
+            }
+        }
+
+        return {
+            businessToken,
+            phoneNumberId,
+            displayPhone,
+            verifiedName,
+            qualityRating,
+            throughputLevel,
+        };
+    } catch (err) {
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId,
+            businessPortfolioId,
+            step: 'ONBOARDING_PROCESS_FATAL',
+            status: 'error',
+            message: `Unexpected fatal error in processOnboarding: ${err.message}`,
+            details: err.stack
+        });
+        return null;
+    }
+}
+
+app.post('/log-signup-event', authenticate, async (req, res) => {
+    try {
+        const { eventName, sessionId, data } = req.body;
+        const tenantId = req.user.tenantId;
+
+        let status = 'info';
+        if (eventName.includes('ERROR') || eventName.includes('FAIL')) {
+            status = 'error';
+        } else if (eventName.includes('CANCEL')) {
+            status = 'warning';
+        } else if (eventName.includes('SUCCESS')) {
+            status = 'success';
+        }
+
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            step: eventName,
+            status,
+            message: `Frontend event: ${eventName}`,
+            details: data,
+            wabaId: data?.wabaId || null,
+            phoneNumberId: data?.phoneNumberId || null,
+            businessPortfolioId: data?.businessPortfolioId || null,
+        });
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error logging signup event:', err.message);
+        res.status(500).json({ error: 'Failed to write log' });
+    }
+});
+
+
+//  Facebook Embedded Signup (Steps 3→7 of Meta Onboarding)
 app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
-    const { code, appId, wabaId, phoneNumberId } = req.body;
+    const {
+        code, appId, wabaId, phoneNumberId,
+        sessionId, sessionInfoResponse,
+        businessPortfolioId,  // ← NEW: Business Portfolio ID from popup postMessage (Step 3)
+    } = req.body;
     const tenantId = req.user.tenantId;
 
-    console.log(`[EmbeddedSignup] Request received for tenantId: ${tenantId}`);
-    console.log(`[EmbeddedSignup] Params - appId: ${appId}, wabaId: ${wabaId || 'N/A'}, phoneNumberId: ${phoneNumberId || 'N/A'}, hasCode: ${!!code}`);
+    await saveOnboardingLog({
+        tenantId,
+        sessionId,
+        wabaId,
+        businessPortfolioId,
+        phoneNumberId,
+        step: 'BACKEND_START',
+        status: 'info',
+        message: 'Backend onboarding flow started.',
+        details: { appId, hasCode: !!code, sessionId }
+    });
 
     if (!appId) {
-        console.warn(`[EmbeddedSignup] Rejecting: Missing appId`);
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            step: 'BACKEND_REJECTED_MISSING_APPID',
+            status: 'error',
+            message: 'Onboarding rejected: Missing appId'
+        });
         return res.status(400).json({ error: 'Missing appId' });
     }
 
-    // App secret is kept server-side — never sent from the client
     const appSecret = process.env.META_APP_SECRET;
     if (!appSecret) {
-        console.error(`[EmbeddedSignup] Rejecting: META_APP_SECRET not configured on server`);
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            step: 'BACKEND_FATAL_MISSING_SECRET',
+            status: 'error',
+            message: 'META_APP_SECRET is not configured on the server environment.'
+        });
         return res.status(500).json({ error: 'META_APP_SECRET not configured on server' });
     }
 
@@ -2753,228 +3078,572 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
 
         // Exchange code for access token only if a code was provided
         if (code && code.trim() !== '') {
-            console.log(`[EmbeddedSignup] Exchanging code with Meta Graph API...`);
-            const tokenResponse = await axios.get(`https://graph.facebook.com/v25.0/oauth/access_token`, {
-                params: { client_id: appId, client_secret: appSecret, code: code.trim() }
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                step: 'BACKEND_EXCHANGE_CODE_START',
+                status: 'info',
+                message: 'Exchanging auth code for user access token...'
             });
-            accessToken = tokenResponse.data.access_token;
-            console.log(`[EmbeddedSignup] Successfully obtained access token (length: ${accessToken ? accessToken.length : 0})`);
+            
+            const apiVersion = process.env.META_API_VERSION || 'v25.0';
+            const tokenUrl = `https://graph.facebook.com/${apiVersion}/oauth/access_token`;
+            
+            try {
+                const tokenResponse = await axios.get(tokenUrl, {
+                    params: { client_id: appId, client_secret: appSecret, code: code.trim() }
+                });
+                accessToken = tokenResponse.data.access_token;
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    step: 'BACKEND_EXCHANGE_CODE_SUCCESS',
+                    status: 'success',
+                    message: 'Successfully exchanged auth code for access token.'
+                });
+            } catch (exErr) {
+                const exErrData = exErr.response?.data || exErr.message;
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    step: 'BACKEND_EXCHANGE_CODE_FAIL',
+                    status: 'error',
+                    message: 'Failed to exchange auth code for user token.',
+                    details: exErrData
+                });
+                throw exErr;
+            }
+        } else {
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                step: 'BACKEND_EXCHANGE_CODE_SKIPPED',
+                status: 'warning',
+                message: 'No auth code provided in request body. Skipping exchange.'
+            });
         }
 
         // If no token obtained (no code), we cannot proceed — fall back to manual config
         if (!accessToken) {
-            console.warn(`[EmbeddedSignup] No access token was exchanged/provided.`);
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                step: 'BACKEND_FALLBACK_NO_TOKEN',
+                status: 'warning',
+                message: 'No access token was exchanged. Returning fallback redirect/status.'
+            });
             return res.status(400).json({
                 error: 'No auth code received from Meta. Please configure manually.',
                 fallback: true,
             });
         }
 
-        // If wabaId/phoneNumberId were not captured via postMessage, auto-fetch from Meta Graph API
+        // Legacy fallback: resolve WABA ID / phone number ID from the user token if not in postMessage
         let resolvedWabaId = wabaId || null;
         let resolvedPhoneNumberId = phoneNumberId || null;
-        let resolvedBusinessId = null;
+        let resolvedBusinessId = businessPortfolioId || null;
 
-        console.log(`[EmbeddedSignup] Initial IDs - resolvedWabaId: ${resolvedWabaId}, resolvedPhoneNumberId: ${resolvedPhoneNumberId}`);
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId: resolvedWabaId,
+            businessPortfolioId: resolvedBusinessId,
+            phoneNumberId: resolvedPhoneNumberId,
+            step: 'BACKEND_CHECK_IDS',
+            status: 'info',
+            message: 'Checking for missing IDs from Meta postMessage.',
+            details: { resolvedWabaId, resolvedPhoneNumberId, resolvedBusinessId }
+        });
 
         if (!resolvedWabaId || !resolvedPhoneNumberId) {
-            console.log(`[EmbeddedSignup] Missing IDs. Attempting to auto-fetch from Meta Graph API...`);
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                step: 'BACKEND_AUTO_RESOLVE_START',
+                status: 'info',
+                message: 'Missing IDs. Querying Meta Graph API for WABA/business properties...'
+            });
+            
             try {
-                // Step 1: correct endpoint for user tokens from Embedded Signup
-                console.log(`[EmbeddedSignup] Step 1: Querying /me/whatsapp_business_accounts`);
-                const wabaRes = await axios.get(`https://graph.facebook.com/v25.0/me/whatsapp_business_accounts`, {
+                const wabaRes = await axios.get(`${WHATSAPP_API_URL}/me/whatsapp_business_accounts`, {
                     params: { access_token: accessToken, fields: 'id,name,business' }
                 });
                 const wabaAccounts = wabaRes.data?.data || [];
-                console.log(`[EmbeddedSignup] Step 1: Found ${wabaAccounts.length} WABA accounts`);
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    step: 'BACKEND_AUTO_RESOLVE_WABA_COUNT',
+                    status: 'info',
+                    message: `Found ${wabaAccounts.length} WABA accounts associated with user token.`
+                });
+                
                 if (wabaAccounts.length > 0) {
                     resolvedWabaId = resolvedWabaId || wabaAccounts[0].id;
-                    resolvedBusinessId = wabaAccounts[0].business?.id || null;
-                    console.log(`[EmbeddedSignup] Step 1: Resolved WABA ID: ${resolvedWabaId}, Business ID: ${resolvedBusinessId}`);
+                    resolvedBusinessId = resolvedBusinessId || wabaAccounts[0].business?.id || null;
+                    await saveOnboardingLog({
+                        tenantId,
+                        sessionId,
+                        wabaId: resolvedWabaId,
+                        businessPortfolioId: resolvedBusinessId,
+                        step: 'BACKEND_AUTO_RESOLVE_WABA_SUCCESS',
+                        status: 'success',
+                        message: `Resolved WABA ID: ${resolvedWabaId}, Business Portfolio ID: ${resolvedBusinessId}`
+                    });
                 }
             } catch (e1) {
-                console.warn('[EmbeddedSignup] /me/whatsapp_business_accounts failed:', e1.response?.data || e1.message);
-                // Step 2: fallback via /me/businesses
+                const e1Data = e1.response?.data || e1.message;
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    step: 'BACKEND_AUTO_RESOLVE_WABA_FAIL',
+                    status: 'warning',
+                    message: '/me/whatsapp_business_accounts query failed. Falling back to /me/businesses.',
+                    details: e1Data
+                });
+                
+                // Fallback via /me/businesses
                 try {
-                    console.log(`[EmbeddedSignup] Step 2: Fallback querying /me/businesses`);
-                    const bizRes = await axios.get(`https://graph.facebook.com/v25.0/me/businesses`, {
+                    const bizRes = await axios.get(`${WHATSAPP_API_URL}/me/businesses`, {
                         params: { access_token: accessToken, fields: 'id,name,owned_whatsapp_business_accounts' }
                     });
-                    console.log(`[EmbeddedSignup] Step 2: Found ${bizRes.data?.data?.length || 0} businesses`);
-                    for (const biz of (bizRes.data?.data || [])) {
+                    const businesses = bizRes.data?.data || [];
+                    for (const biz of businesses) {
                         const owned = biz.owned_whatsapp_business_accounts?.data || [];
                         if (owned.length > 0) {
                             resolvedWabaId = resolvedWabaId || owned[0].id;
                             resolvedBusinessId = resolvedBusinessId || biz.id;
-                            console.log(`[EmbeddedSignup] Step 2: Resolved WABA ID: ${resolvedWabaId} via Business: ${biz.id}`);
+                            await saveOnboardingLog({
+                                tenantId,
+                                sessionId,
+                                wabaId: resolvedWabaId,
+                                businessPortfolioId: resolvedBusinessId,
+                                step: 'BACKEND_AUTO_RESOLVE_BIZ_SUCCESS',
+                                status: 'success',
+                                message: `Resolved WABA ID: ${resolvedWabaId} via Business: ${biz.id}`
+                            });
                             break;
                         }
                     }
                 } catch (e2) {
-                    console.warn('[EmbeddedSignup] /me/businesses fallback failed:', e2.response?.data || e2.message);
+                    const e2Data = e2.response?.data || e2.message;
+                    await saveOnboardingLog({
+                        tenantId,
+                        sessionId,
+                        step: 'BACKEND_AUTO_RESOLVE_BIZ_FAIL',
+                        status: 'warning',
+                        message: '/me/businesses query failed.',
+                        details: e2Data
+                    });
                 }
             }
 
-            // Step 3: fetch phone numbers once we have a WABA ID
+            // fetch phone numbers if we now have a WABA ID but no phone ID
             if (resolvedWabaId && !resolvedPhoneNumberId) {
                 try {
-                    console.log(`[EmbeddedSignup] Step 3: Querying phone numbers for WABA ID: ${resolvedWabaId}`);
-                    const phoneRes = await axios.get(`https://graph.facebook.com/v25.0/${resolvedWabaId}/phone_numbers`, {
+                    const phoneRes = await axios.get(`${WHATSAPP_API_URL}/${resolvedWabaId}/phone_numbers`, {
                         params: { access_token: accessToken, fields: 'id,display_phone_number,verified_name' }
                     });
                     const phones = phoneRes.data?.data || [];
-                    console.log(`[EmbeddedSignup] Step 3: Found ${phones.length} phone numbers`);
                     if (phones.length > 0) {
                         resolvedPhoneNumberId = phones[0].id;
-                        console.log(`[EmbeddedSignup] Step 3: Resolved Phone Number ID: ${resolvedPhoneNumberId} (${phones[0].display_phone_number})`);
+                        await saveOnboardingLog({
+                            tenantId,
+                            sessionId,
+                            wabaId: resolvedWabaId,
+                            phoneNumberId: resolvedPhoneNumberId,
+                            step: 'BACKEND_AUTO_RESOLVE_PHONE_SUCCESS',
+                            status: 'success',
+                            message: `Resolved Phone Number ID: ${resolvedPhoneNumberId} (${phones[0].display_phone_number})`
+                        });
+                    } else {
+                        await saveOnboardingLog({
+                            tenantId,
+                            sessionId,
+                            wabaId: resolvedWabaId,
+                            step: 'BACKEND_AUTO_RESOLVE_PHONE_EMPTY',
+                            status: 'warning',
+                            message: 'No phone numbers found in WABA account.'
+                        });
                     }
                 } catch (e3) {
-                    console.warn('[EmbeddedSignup] phone_numbers fetch failed:', e3.response?.data || e3.message);
+                    const e3Data = e3.response?.data || e3.message;
+                    await saveOnboardingLog({
+                        tenantId,
+                        sessionId,
+                        wabaId: resolvedWabaId,
+                        step: 'BACKEND_AUTO_RESOLVE_PHONE_FAIL',
+                        status: 'warning',
+                        message: 'Phone number list fetch failed.',
+                        details: e3Data
+                    });
                 }
             }
+        } else {
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                step: 'BACKEND_AUTO_RESOLVE_SKIPPED',
+                status: 'info',
+                message: 'Skipping auto-resolution of IDs because both WABA ID and Phone ID are already provided.'
+            });
         }
 
-        // Only update fields that have a value — never overwrite existing IDs with null
-        const updateFields = {
+        // Base update: store the user token and IDs resolved above
+        const baseUpdateFields = {
             'whatsappConfig.accessToken': accessToken,
             'whatsappConfig.metaAppId': appId,
             'whatsappConfig.verified': !!(accessToken && resolvedWabaId && resolvedPhoneNumberId),
         };
-        if (resolvedWabaId) updateFields['whatsappConfig.businessAccountId'] = resolvedWabaId;
-        if (resolvedPhoneNumberId) updateFields['whatsappConfig.phoneNumberId'] = resolvedPhoneNumberId;
+        if (resolvedWabaId)         baseUpdateFields['whatsappConfig.businessAccountId']  = resolvedWabaId;
+        if (resolvedPhoneNumberId)  baseUpdateFields['whatsappConfig.phoneNumberId']       = resolvedPhoneNumberId;
+        if (resolvedBusinessId)     baseUpdateFields['whatsappConfig.businessPortfolioId'] = resolvedBusinessId;
+        if (resolvedBusinessId)     baseUpdateFields['whatsappConfig.businessId']          = resolvedBusinessId;
 
-        console.log(`[EmbeddedSignup] Updating Tenant MongoDB document for tenantId: ${tenantId}`);
-        console.log(`[EmbeddedSignup] Fields to update:`, JSON.stringify(updateFields, null, 2));
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId: resolvedWabaId,
+            businessPortfolioId: resolvedBusinessId,
+            phoneNumberId: resolvedPhoneNumberId,
+            step: 'BACKEND_DB_UPDATE_START',
+            status: 'info',
+            message: 'Saving initial configuration parameters to MongoDB Tenant...',
+            details: baseUpdateFields
+        });
 
-        const updatedTenant = await Tenant.findByIdAndUpdate(tenantId, updateFields, { new: true });
-        console.log(`[EmbeddedSignup] MongoDB update successful. New config:`, JSON.stringify(updatedTenant?.whatsappConfig, null, 2));
+        const updatedTenant = await Tenant.findByIdAndUpdate(tenantId, { $set: baseUpdateFields }, { new: true });
+        
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            step: 'BACKEND_DB_UPDATE_SUCCESS',
+            status: 'success',
+            message: 'Tenant document updated successfully with Meta SDK parameters.',
+            details: updatedTenant?.whatsappConfig
+        });
 
-        // Auto-subscribe the WABA to receive webhook events from our app (CRITICAL for Embedded Signup webhooks)
+        // Auto-subscribe the WABA to receive webhook events from our app
         if (resolvedWabaId && accessToken) {
             try {
-                console.log(`[EmbeddedSignup] Registering WABA to receive webhooks from App ${appId}...`);
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    wabaId: resolvedWabaId,
+                    step: 'BACKEND_SUBSCRIBE_WEBHOOKS_START',
+                    status: 'info',
+                    message: `Subscribing WABA ${resolvedWabaId} to our app webhooks...`
+                });
+
                 await axios.post(
-                    `https://graph.facebook.com/v25.0/${resolvedWabaId}/subscribed_apps`,
+                    `${WHATSAPP_API_URL}/${resolvedWabaId}/subscribed_apps`,
                     null,
                     { params: { access_token: accessToken } }
                 );
-                console.log(`[EmbeddedSignup] Automatically subscribed WABA ${resolvedWabaId} to app webhooks`);
+                
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    wabaId: resolvedWabaId,
+                    step: 'BACKEND_SUBSCRIBE_WEBHOOKS_SUCCESS',
+                    status: 'success',
+                    message: `Automatically subscribed WABA ${resolvedWabaId} to webhooks successfully.`
+                });
             } catch (subErr) {
-                console.error('[EmbeddedSignup] Failed to auto-subscribe WABA to app webhooks:', subErr.response?.data || subErr.message);
+                const subErrData = subErr.response?.data || subErr.message;
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    wabaId: resolvedWabaId,
+                    step: 'BACKEND_SUBSCRIBE_WEBHOOKS_FAIL',
+                    status: 'error',
+                    message: `Failed to subscribe WABA to app webhooks.`,
+                    details: subErrData
+                });
             }
+        } else {
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                step: 'BACKEND_SUBSCRIBE_WEBHOOKS_SKIPPED',
+                status: 'warning',
+                message: 'Skipping webhook subscription because WABA ID or Access Token is missing.'
+            });
         }
 
-        res.json({
+        // ── Official Steps 4→5→6: If businessPortfolioId is known, run processOnboarding() ──
+        let onboardingResult = null;
+        if (resolvedWabaId && resolvedBusinessId) {
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                wabaId: resolvedWabaId,
+                businessPortfolioId: resolvedBusinessId,
+                step: 'BACKEND_PROCESS_ONBOARDING_START',
+                status: 'info',
+                message: 'Triggering processOnboarding() to exchange user token for a permanent System User business token...'
+            });
+
+            onboardingResult = await processOnboarding(resolvedWabaId, resolvedBusinessId, tenantId, sessionId);
+            
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                wabaId: resolvedWabaId,
+                businessPortfolioId: resolvedBusinessId,
+                step: 'BACKEND_PROCESS_ONBOARDING_FINISH',
+                status: onboardingResult ? 'success' : 'warning',
+                message: 'processOnboarding finished execution.',
+                details: onboardingResult
+            });
+        } else {
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                step: 'BACKEND_PROCESS_ONBOARDING_SKIPPED',
+                status: 'warning',
+                message: `Skipping processOnboarding because resolvedWabaId (${resolvedWabaId}) or resolvedBusinessId (${resolvedBusinessId}) is missing.`
+            });
+        }
+
+        // Refresh tenant from DB to get the final merged state
+        const finalTenant = await Tenant.findById(tenantId);
+        const finalConfig = finalTenant?.whatsappConfig || {};
+
+        const successResp = {
             success: true,
-            message: resolvedWabaId && resolvedPhoneNumberId
+            message: finalConfig.phoneNumberId && finalConfig.businessAccountId
                 ? 'WhatsApp Account connected successfully!'
                 : 'Token saved. IDs could not be auto-fetched — please verify in settings.',
-            partialConnect: !(resolvedWabaId && resolvedPhoneNumberId),
+            partialConnect: !(finalConfig.phoneNumberId && finalConfig.businessAccountId),
             config: {
-                accessToken,
-                wabaId: resolvedWabaId,
-                phoneNumberId: resolvedPhoneNumberId,
-                businessId: resolvedBusinessId,
-                metaAppId: appId,
-                verified: !!(accessToken && resolvedWabaId && resolvedPhoneNumberId),
+                accessToken:      finalConfig.accessToken,
+                wabaId:           finalConfig.businessAccountId,
+                phoneNumberId:    finalConfig.phoneNumberId,
+                businessId:       finalConfig.businessId,
+                businessPortfolioId: finalConfig.businessPortfolioId,
+                displayPhone:     finalConfig.displayPhone,
+                verifiedName:     finalConfig.verifiedName,
+                qualityRating:    finalConfig.qualityRating,
+                throughputLevel:  finalConfig.throughputLevel,
+                metaAppId:        appId,
+                verified:         finalConfig.verified,
             }
+        };
+
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            step: 'BACKEND_ONBOARDING_COMPLETE',
+            status: 'success',
+            message: 'Meta onboarding backend workflow completed successfully.',
+            details: { partialConnect: successResp.partialConnect, verified: finalConfig.verified }
         });
+
+        res.json(successResp);
     } catch (error) {
         const errorData = error.response?.data || error.message;
-        console.error(`[EmbeddedSignup] Fatal Error in signup flow:`, errorData);
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            step: 'BACKEND_ONBOARDING_FATAL',
+            status: 'error',
+            message: 'Fatal error occurred in backend onboarding execution.',
+            details: errorData
+        });
         res.status(500).json({ error: 'Failed to exchange Meta code for token', details: errorData });
     }
 });
 
 // Re-fetch WABA ID + Phone ID using the already-stored access token (no re-auth needed)
+// Re-fetch WABA ID + Phone ID + business token using stored credentials
 app.post('/refresh-meta-account', authenticate, async (req, res) => {
     const tenantId = req.user.tenantId;
+    const { sessionId } = req.body; // Allow optional sessionId from client for tracking
+
+    await saveOnboardingLog({
+        tenantId,
+        sessionId,
+        step: 'BACKEND_REFRESH_START',
+        status: 'info',
+        message: 'Refresh Meta account credentials requested.'
+    });
+
     try {
         const tenant = await Tenant.findById(tenantId);
-        if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+        if (!tenant) {
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                step: 'BACKEND_REFRESH_TENANT_NOT_FOUND',
+                status: 'error',
+                message: 'Refresh failed: Tenant not found in DB.'
+            });
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
 
         const accessToken = tenant.whatsappConfig?.accessToken;
-        if (!accessToken) return res.status(400).json({ error: 'No access token stored. Please reconnect.' });
+        if (!accessToken) {
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                step: 'BACKEND_REFRESH_NO_TOKEN',
+                status: 'error',
+                message: 'Refresh failed: No access token stored. Connect Meta account first.'
+            });
+            return res.status(400).json({ error: 'No access token stored. Please reconnect.' });
+        }
 
         let resolvedWabaId = tenant.whatsappConfig.businessAccountId || null;
         let resolvedPhoneNumberId = tenant.whatsappConfig.phoneNumberId || null;
-        let resolvedBusinessId = null;
+        let resolvedBusinessId = tenant.whatsappConfig.businessPortfolioId || tenant.whatsappConfig.businessId || null;
 
-        try {
-            const wabaRes = await axios.get(`https://graph.facebook.com/v25.0/me/whatsapp_business_accounts`, {
-                params: { access_token: accessToken, fields: 'id,name,business' }
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            wabaId: resolvedWabaId,
+            businessPortfolioId: resolvedBusinessId,
+            phoneNumberId: resolvedPhoneNumberId,
+            step: 'BACKEND_REFRESH_CHECK_PARAMS',
+            status: 'info',
+            message: 'Retrieved stored configs for refresh.',
+            details: { resolvedWabaId, resolvedPhoneNumberId, resolvedBusinessId }
+        });
+
+        // If we have a stored businessPortfolioId, run the official Steps 4→5→6
+        if (resolvedWabaId && resolvedBusinessId) {
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                wabaId: resolvedWabaId,
+                businessPortfolioId: resolvedBusinessId,
+                step: 'BACKEND_REFRESH_TRIGGER_ONBOARDING',
+                status: 'info',
+                message: 'Triggering processOnboarding() for permanent token exchange...'
             });
-            const accounts = wabaRes.data?.data || [];
-            if (accounts.length > 0) {
-                resolvedWabaId = accounts[0].id;
-                resolvedBusinessId = accounts[0].business?.id || null;
+            const onboardResult = await processOnboarding(resolvedWabaId, resolvedBusinessId, tenantId, sessionId);
+            if (onboardResult?.phoneNumberId) {
+                resolvedPhoneNumberId = onboardResult.phoneNumberId;
             }
-        } catch (e1) {
-            try {
-                const bizRes = await axios.get(`https://graph.facebook.com/v25.0/me/businesses`, {
-                    params: { access_token: accessToken, fields: 'id,name,owned_whatsapp_business_accounts' }
-                });
-                for (const biz of (bizRes.data?.data || [])) {
-                    const owned = biz.owned_whatsapp_business_accounts?.data || [];
-                    if (owned.length > 0) {
-                        resolvedWabaId = owned[0].id;
-                        resolvedBusinessId = biz.id;
-                        break;
-                    }
-                }
-            } catch (e2) {
-                console.warn('[RefreshMeta] businesses fallback failed:', e2.response?.data || e2.message);
-            }
+        } else {
+            await saveOnboardingLog({
+                tenantId,
+                sessionId,
+                wabaId: resolvedWabaId,
+                businessPortfolioId: resolvedBusinessId,
+                step: 'BACKEND_REFRESH_ONBOARDING_SKIPPED',
+                status: 'warning',
+                message: 'Skipping processOnboarding exchange because resolvedWabaId or resolvedBusinessId is missing from config.'
+            });
         }
 
-        if (resolvedWabaId && !resolvedPhoneNumberId) {
-            try {
-                const phoneRes = await axios.get(`https://graph.facebook.com/v25.0/${resolvedWabaId}/phone_numbers`, {
-                    params: { access_token: accessToken, fields: 'id,display_phone_number,verified_name' }
-                });
-                const phones = phoneRes.data?.data || [];
-                if (phones.length > 0) resolvedPhoneNumberId = phones[0].id;
-            } catch (e3) {
-                console.warn('[RefreshMeta] phone_numbers fetch failed:', e3.response?.data || e3.message);
-            }
-        }
-
-        const updateFields = {
-            'whatsappConfig.verified': !!(accessToken && resolvedWabaId && resolvedPhoneNumberId),
-        };
-        if (resolvedWabaId) updateFields['whatsappConfig.businessAccountId'] = resolvedWabaId;
-        if (resolvedPhoneNumberId) updateFields['whatsappConfig.phoneNumberId'] = resolvedPhoneNumberId;
-
-        await Tenant.findByIdAndUpdate(tenantId, updateFields);
-
-        // Auto-subscribe/re-subscribe the WABA to receive webhook events (CRITICAL for Embedded Signup webhooks)
+        // Auto-subscribe/re-subscribe the WABA to receive webhook events
         if (resolvedWabaId && accessToken) {
             try {
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    wabaId: resolvedWabaId,
+                    step: 'BACKEND_REFRESH_SUBSCRIBE_START',
+                    status: 'info',
+                    message: `Subscribing WABA ${resolvedWabaId} to app webhooks...`
+                });
+
+                const apiVer = process.env.META_API_VERSION || 'v25.0';
                 await axios.post(
-                    `https://graph.facebook.com/v25.0/${resolvedWabaId}/subscribed_apps`,
+                    `https://graph.facebook.com/${apiVer}/${resolvedWabaId}/subscribed_apps`,
                     null,
                     { params: { access_token: accessToken } }
                 );
-                console.log(`[RefreshMeta] Automatically subscribed/re-subscribed WABA ${resolvedWabaId} to app webhooks`);
+                
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    wabaId: resolvedWabaId,
+                    step: 'BACKEND_REFRESH_SUBSCRIBE_SUCCESS',
+                    status: 'success',
+                    message: `Subscribed WABA ${resolvedWabaId} to app webhooks successfully.`
+                });
             } catch (subErr) {
-                console.error('[RefreshMeta] Failed to auto-subscribe WABA to app webhooks:', subErr.response?.data || subErr.message);
+                const subErrData = subErr.response?.data || subErr.message;
+                await saveOnboardingLog({
+                    tenantId,
+                    sessionId,
+                    wabaId: resolvedWabaId,
+                    step: 'BACKEND_REFRESH_SUBSCRIBE_FAIL',
+                    status: 'error',
+                    message: 'Failed to subscribe WABA to app webhooks during refresh.',
+                    details: subErrData
+                });
             }
         }
+
+        // Read final state from DB
+        const finalTenant = await Tenant.findById(tenantId);
+        const finalConfig = finalTenant?.whatsappConfig || {};
+
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            step: 'BACKEND_REFRESH_COMPLETE',
+            status: 'success',
+            message: 'Refresh Meta account credentials completed successfully.',
+            details: { verified: finalConfig.verified }
+        });
 
         res.json({
             success: true,
             config: {
-                accessToken,
-                wabaId: resolvedWabaId,
-                phoneNumberId: resolvedPhoneNumberId,
-                businessId: resolvedBusinessId,
-                verified: !!(accessToken && resolvedWabaId && resolvedPhoneNumberId),
+                accessToken:        finalConfig.accessToken,
+                wabaId:             finalConfig.businessAccountId,
+                phoneNumberId:      finalConfig.phoneNumberId,
+                businessId:         finalConfig.businessId,
+                businessPortfolioId: finalConfig.businessPortfolioId,
+                displayPhone:       finalConfig.displayPhone,
+                verifiedName:       finalConfig.verifiedName,
+                qualityRating:      finalConfig.qualityRating,
+                throughputLevel:    finalConfig.throughputLevel,
+                verified:           finalConfig.verified,
             }
         });
     } catch (error) {
-        res.status(500).json({ error: 'Failed to refresh Meta account', details: error.response?.data || error.message });
+        const errorData = error.response?.data || error.message;
+        await saveOnboardingLog({
+            tenantId,
+            sessionId,
+            step: 'BACKEND_REFRESH_FATAL',
+            status: 'error',
+            message: 'Fatal error occurred in backend refresh execution.',
+            details: errorData
+        });
+        res.status(500).json({ error: 'Failed to refresh Meta account', details: errorData });
     }
 });
+
+// GET Onboarding Logs for a Tenant
+app.get('/onboarding-logs', authenticate, async (req, res) => {
+    try {
+        const tenantId = req.user.tenantId;
+        const logs = await OnboardingLog.find({ tenantId }).sort({ timestamp: -1 }).limit(100);
+        res.json({ success: true, logs });
+    } catch (err) {
+        console.error('Error fetching onboarding logs:', err.message);
+        res.status(500).json({ error: 'Failed to fetch onboarding logs' });
+    }
+});
+
+// GET Onboarding Logs for a specific session ID
+app.get('/onboarding-logs/:sessionId', authenticate, async (req, res) => {
+    try {
+        const tenantId = req.user.tenantId;
+        const { sessionId } = req.params;
+        const logs = await OnboardingLog.find({ tenantId, sessionId }).sort({ timestamp: 1 });
+        res.json({ success: true, logs });
+    } catch (err) {
+        console.error(`Error fetching onboarding logs for session ${req.params.sessionId}:`, err.message);
+        res.status(500).json({ error: 'Failed to fetch onboarding logs' });
+    }
+});
+
 
 //  Media Upload Proxies 
 app.post('/upload-media', authenticate, async (req, res) => {
@@ -3848,10 +4517,51 @@ app.post('/webhook', async (req, res) => {
 
     if (body.object !== 'whatsapp_business_account') return res.sendStatus(404);
 
+    // ── Step 3: Handle account_update PARTNER_ADDED event ───────────────────────
+    // Meta fires this when a business customer completes the Embedded Signup flow.
+    // We must respond 200 first (within 20 seconds), then process asynchronously.
+    for (const entry of body.entry || []) {
+        for (const change of entry.changes || []) {
+            const val = change.value;
+            if (change.field === 'account_update' && val?.event === 'PARTNER_ADDED') {
+                res.sendStatus(200); // Respond immediately to Meta
+                const wabaId = val.waba_id || entry.id;
+                const businessPortfolioId = val.business_portfolio_id || null;
+                
+                await saveOnboardingLog({
+                    tenantId: null,
+                    sessionId: null,
+                    wabaId,
+                    businessPortfolioId,
+                    step: 'WEBHOOK_PARTNER_ADDED',
+                    status: 'info',
+                    message: `Received account_update PARTNER_ADDED webhook from Meta. Triggering background onboarding...`,
+                    details: val
+                });
+
+                // Trigger Steps 4→5→6 asynchronously (null tenantId = match by WABA ID)
+                processOnboarding(wabaId, businessPortfolioId, null).catch(async (err) => {
+                    await saveOnboardingLog({
+                        tenantId: null,
+                        sessionId: null,
+                        wabaId,
+                        businessPortfolioId,
+                        step: 'WEBHOOK_PROCESS_ONBOARDING_FAIL',
+                        status: 'error',
+                        message: `Background onboarding triggered by webhook failed: ${err.message}`,
+                        details: err.stack
+                    });
+                });
+                return; // already sent 200
+            }
+        }
+    }
+
     try {
         const entry = body.entry[0];
         const value = entry.changes[0].value;
         const receiverPhoneNumberId = value.metadata?.phone_number_id;
+
 
         // Handle Status Updates
         if (value.statuses) {
@@ -4121,7 +4831,7 @@ async function runScheduledCampaigns() {
                         messaging_product: 'whatsapp', to: recipient.mobileNumber, type: 'template',
                         template: { name: sc.template, language: { code: sc.language || 'en_US' }, ...(components.length ? { components } : {}) }
                     };
-                    const resp = await axios.post(`https://graph.facebook.com/v25.0/${config.phoneNumberId}/messages`, payload, {
+                    const resp = await axios.post(`${WHATSAPP_API_URL}/${config.phoneNumberId}/messages`, payload, {
                         headers: { Authorization: `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' }
                     });
                     if (resp.data?.messages?.[0]?.id) {
@@ -4454,7 +5164,7 @@ async function dispatchTemplate(tenantId, lead, trigger) {
     }
 
     const { phoneNumberId, accessToken } = tenant.whatsappConfig;
-    const url = `https://graph.facebook.com/v25.0/${phoneNumberId}/messages`;
+    const url = `${WHATSAPP_API_URL}/${phoneNumberId}/messages`;
 
     // Resolve body variables
     const components = await fetchTemplateComponents(tenant, trigger.templateName);
@@ -4619,7 +5329,7 @@ async function evaluateClientTrigger(tenantId, client) {
         }
 
         const { phoneNumberId, accessToken } = tenant.whatsappConfig;
-        const url = `https://graph.facebook.com/v25.0/${phoneNumberId}/messages`;
+        const url = `${WHATSAPP_API_URL}/${phoneNumberId}/messages`;
 
         // Step 3: POST to Meta Cloud API v25.0
         const tplComponents = await fetchTemplateComponents(tenant, trigger.templateName);
