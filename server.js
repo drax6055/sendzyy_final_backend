@@ -4262,6 +4262,30 @@ async function handleActionNode(session, node, tenant, from) {
         const templateName = data.templateName || data.template || '';
         const language = data.language || 'en_US';
         if (templateName) {
+            const components = [];
+            const mediaUrl = data.mediaUrl || data.mediaId || '';
+            const mediaType = data.mediaType || ''; // 'image' | 'video' | 'document'
+
+            if (mediaUrl && mediaType) {
+                const isUrl = mediaUrl.startsWith('http://') || mediaUrl.startsWith('https://');
+                const mediaObject = isUrl ? { link: mediaUrl } : { id: mediaUrl };
+                const type = mediaType.toLowerCase();
+                components.push({
+                    type: 'header',
+                    parameters: [
+                        { type, [type]: mediaObject }
+                    ]
+                });
+            }
+
+            const variables = data.variables || [];
+            if (Array.isArray(variables) && variables.length > 0) {
+                components.push({
+                    type: 'body',
+                    parameters: variables.map(v => ({ type: 'text', text: String(v) }))
+                });
+            }
+
             try {
                 await axios.post(
                     `${WHATSAPP_API_URL}/${phoneNumberId}/messages`,
@@ -4269,7 +4293,11 @@ async function handleActionNode(session, node, tenant, from) {
                         messaging_product: 'whatsapp',
                         to: from,
                         type: 'template',
-                        template: { name: templateName, language: { code: language } },
+                        template: { 
+                            name: templateName, 
+                            language: { code: language },
+                            ...(components.length ? { components } : {})
+                        },
                     },
                     { headers: { Authorization: `Bearer ${accessToken}` } }
                 );
