@@ -62,6 +62,7 @@ const tenantSchema = new mongoose.Schema({
         throughputLevel: String,        // STANDARD / HIGH / NOT_APPLICABLE (Step 6)
         onboardedAt: Date,              // Timestamp when PARTNER_ADDED webhook fired (Step 3)
         verified: { type: Boolean, default: false },
+        templateRejections: { type: Map, of: String, default: {} }, // Map of templateName -> rejectionReason
     },
     webhookSecret: { type: String, default: '' },  // AES-256 encrypted hex string
     openaiApiKey: { type: String, default: '' },
@@ -409,7 +410,7 @@ async function saveOnboardingLog({ tenantId, sessionId, wabaId, businessPortfoli
             message,
             details
         });
-        
+
         // If tenantId is missing but we have wabaId, try to find the tenant to backfill tenantId
         if (!log.tenantId && wabaId) {
             const tenant = await Tenant.findOne({ 'whatsappConfig.businessAccountId': wabaId });
@@ -417,9 +418,9 @@ async function saveOnboardingLog({ tenantId, sessionId, wabaId, businessPortfoli
                 log.tenantId = tenant._id.toString();
             }
         }
-        
+
         await log.save();
-        
+
         const prefix = `[Onboarding][${status.toUpperCase()}][${step}]`;
         const detailsStr = details ? ` | Details: ${JSON.stringify(details)}` : '';
         console.log(`${prefix} ${message}${detailsStr}`);
@@ -867,6 +868,27 @@ const authenticate = (req, res, next) => {
         next();
     });
 };
+
+//  System Update broadcast (triggered via Postman/admin)
+app.post('/api/admin/system-update', (req, res) => {
+    const { secret, message } = req.body;
+    const adminSecret = process.env.ADMIN_UPDATE_SECRET || 'sendzyy-update-secret-9988';
+
+    if (!secret || secret !== adminSecret) {
+        return res.status(401).json({ error: 'Unauthorized: Invalid secret' });
+    }
+
+    if (!message || typeof message !== 'string') {
+        return res.status(400).json({ error: 'Bad Request: Message is required and must be a string' });
+    }
+
+    console.log(`[System Update] Triggered update alert broadcast with message: "${message}"`);
+
+    // Broadcast update alert to all connected sockets
+    io.emit('system_update', { message });
+
+    return res.json({ success: true, message: 'Broadcast sent to all clients.' });
+});
 
 //  Register — validates only, does NOT save to DB. Returns a short-lived registration token.
 app.post('/register', async (req, res) => {
@@ -1355,6 +1377,88 @@ app.post('/update-config', authenticate, async (req, res) => {
         res.json({ success: true, message: 'Configuration updated' });
     } catch (error) {
         res.status(500).json({ error: 'Failed to update configuration' });
+    }
+});
+
+// GET /onboarding-status — Checks verification status dynamically from Meta and templates setup
+app.get('/onboarding-status', authenticate, async (req, res) => {
+    try {
+        const tenant = await Tenant.findById(req.user.tenantId);
+        if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+        
+        const config = tenant.whatsappConfig || {};
+        const wabaId = config.businessAccountId;
+        const accessToken = config.accessToken;
+        const phoneId = config.phoneNumberId;
+        
+        const status = {
+            whatsappConnected: !!(wabaId && accessToken),
+            phoneVerified: !!phoneId,
+            metaBusinessVerified: 'NOT_VERIFIED', // VERIFIED | PENDING | NOT_VERIFIED
+            hasApprovedTemplate: false
+        };
+        
+        if (status.whatsappConnected) {
+            try {
+                const wabaRes = await axios.get(
+                    `${WHATSAPP_API_URL}/${wabaId}`,
+                    {
+                        params: {
+                            fields: 'business_verification_status',
+                            access_token: accessToken
+                        }
+                    }
+                );
+                
+                const metaStatus = wabaRes.data?.business_verification_status;
+                if (metaStatus === 'verified') {
+                    status.metaBusinessVerified = 'VERIFIED';
+                } else if (['pending', 'pending_need_feedback', 'pending_rca', 'pending_submission', 'in_eligibility_review'].includes(metaStatus)) {
+                    status.metaBusinessVerified = 'PENDING';
+                } else {
+                    status.metaBusinessVerified = 'NOT_VERIFIED';
+                }
+            } catch (err) {
+                console.error('[OnboardingStatus] Failed to fetch business_verification_status:', err.response?.data || err.message);
+            }
+            
+            try {
+                const templatesRes = await axios.get(
+                    `${WHATSAPP_API_URL}/${wabaId}/message_templates`,
+                    {
+                        params: {
+                            access_token: accessToken,
+                            limit: 100
+                        }
+                    }
+                );
+                const templates = templatesRes.data?.data || [];
+                status.hasApprovedTemplate = templates.some(t => t.status === 'APPROVED');
+            } catch (err) {
+                console.error('[OnboardingStatus] Failed to fetch message templates:', err.response?.data || err.message);
+            }
+        }
+        
+        res.json(status);
+    } catch (error) {
+        console.error('[OnboardingStatus] Fatal error:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// GET /template-rejection-reason/:name — Fetches cached rejection reason for a template
+app.get('/template-rejection-reason/:name', authenticate, async (req, res) => {
+    try {
+        const tenant = await Tenant.findById(req.user.tenantId);
+        if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+        
+        const templateName = req.params.name;
+        const savedReason = tenant.whatsappConfig?.templateRejections?.get(templateName) || null;
+        
+        res.json({ name: templateName, reason: savedReason });
+    } catch (error) {
+        console.error('[TemplateRejectionReason] Error:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
     }
 });
 
@@ -2728,8 +2832,8 @@ app.post('/status-mappings', authenticate, async (req, res) => {
 async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionId = null) {
     const tag = '[processOnboarding]';
     const systemToken = process.env.META_SYSTEM_TOKEN;
-    const appSecret   = process.env.META_APP_SECRET;
-    const apiVersion  = process.env.META_API_VERSION || 'v25.0';
+    const appSecret = process.env.META_APP_SECRET;
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
 
     await saveOnboardingLog({
         tenantId,
@@ -2789,7 +2893,7 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
             status: 'info',
             message: `Step 5: Querying customer business system user token for portfolio: ${businessPortfolioId}`
         });
-        
+
         let businessToken = null;
         try {
             const tokenRes = await axios.post(
@@ -2806,7 +2910,7 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
                 }
             );
             businessToken = tokenRes.data.access_token;
-            
+
             await saveOnboardingLog({
                 tenantId,
                 sessionId,
@@ -2843,10 +2947,10 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
             message: `Step 6: Querying authoritative phone numbers for WABA ID: ${wabaId}`
         });
 
-        let phoneNumberId   = null;
-        let displayPhone    = null;
-        let verifiedName    = null;
-        let qualityRating   = null;
+        let phoneNumberId = null;
+        let displayPhone = null;
+        let verifiedName = null;
+        let qualityRating = null;
         let throughputLevel = null;
 
         try {
@@ -2860,15 +2964,15 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
                 }
             );
             const phones = phoneRes.data?.data || [];
-            
+
             if (phones.length > 0) {
-                const phone    = phones[0];
-                phoneNumberId   = phone.id;
-                displayPhone    = phone.display_phone_number;
-                verifiedName    = phone.verified_name;
-                qualityRating   = phone.quality_rating;
+                const phone = phones[0];
+                phoneNumberId = phone.id;
+                displayPhone = phone.display_phone_number;
+                verifiedName = phone.verified_name;
+                qualityRating = phone.quality_rating;
                 throughputLevel = phone.throughput?.level;
-                
+
                 await saveOnboardingLog({
                     tenantId,
                     sessionId,
@@ -2904,16 +3008,16 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
 
         // ── Step 7: Persist to MongoDB ──────────────────────────────────────
         const updateFields = {
-            'whatsappConfig.businessAccountId':  wabaId,
+            'whatsappConfig.businessAccountId': wabaId,
             'whatsappConfig.businessPortfolioId': businessPortfolioId,
-            'whatsappConfig.onboardedAt':         new Date(),
+            'whatsappConfig.onboardedAt': new Date(),
             'whatsappConfig.verified': !!(businessToken && phoneNumberId),
         };
-        if (businessToken)   updateFields['whatsappConfig.accessToken']    = businessToken;
-        if (phoneNumberId)   updateFields['whatsappConfig.phoneNumberId']   = phoneNumberId;
-        if (displayPhone)    updateFields['whatsappConfig.displayPhone']    = displayPhone;
-        if (verifiedName)    updateFields['whatsappConfig.verifiedName']    = verifiedName;
-        if (qualityRating)   updateFields['whatsappConfig.qualityRating']   = qualityRating;
+        if (businessToken) updateFields['whatsappConfig.accessToken'] = businessToken;
+        if (phoneNumberId) updateFields['whatsappConfig.phoneNumberId'] = phoneNumberId;
+        if (displayPhone) updateFields['whatsappConfig.displayPhone'] = displayPhone;
+        if (verifiedName) updateFields['whatsappConfig.verifiedName'] = verifiedName;
+        if (qualityRating) updateFields['whatsappConfig.qualityRating'] = qualityRating;
         if (throughputLevel) updateFields['whatsappConfig.throughputLevel'] = throughputLevel;
 
         await saveOnboardingLog({
@@ -3085,10 +3189,10 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
                 status: 'info',
                 message: 'Exchanging auth code for user access token...'
             });
-            
+
             const apiVersion = process.env.META_API_VERSION || 'v25.0';
             const tokenUrl = `https://graph.facebook.com/${apiVersion}/oauth/access_token`;
-            
+
             try {
                 const tokenResponse = await axios.get(tokenUrl, {
                     params: { client_id: appId, client_secret: appSecret, code: code.trim() }
@@ -3163,7 +3267,7 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
                 status: 'info',
                 message: 'Missing IDs. Querying Meta Graph API for WABA/business properties...'
             });
-            
+
             try {
                 const wabaRes = await axios.get(`${WHATSAPP_API_URL}/me/whatsapp_business_accounts`, {
                     params: { access_token: accessToken, fields: 'id,name,business' }
@@ -3176,7 +3280,7 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
                     status: 'info',
                     message: `Found ${wabaAccounts.length} WABA accounts associated with user token.`
                 });
-                
+
                 if (wabaAccounts.length > 0) {
                     resolvedWabaId = resolvedWabaId || wabaAccounts[0].id;
                     resolvedBusinessId = resolvedBusinessId || wabaAccounts[0].business?.id || null;
@@ -3200,7 +3304,7 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
                     message: '/me/whatsapp_business_accounts query failed. Falling back to /me/businesses.',
                     details: e1Data
                 });
-                
+
                 // Fallback via /me/businesses
                 try {
                     const bizRes = await axios.get(`${WHATSAPP_API_URL}/me/businesses`, {
@@ -3294,10 +3398,10 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
             'whatsappConfig.metaAppId': appId,
             'whatsappConfig.verified': !!(accessToken && resolvedWabaId && resolvedPhoneNumberId),
         };
-        if (resolvedWabaId)         baseUpdateFields['whatsappConfig.businessAccountId']  = resolvedWabaId;
-        if (resolvedPhoneNumberId)  baseUpdateFields['whatsappConfig.phoneNumberId']       = resolvedPhoneNumberId;
-        if (resolvedBusinessId)     baseUpdateFields['whatsappConfig.businessPortfolioId'] = resolvedBusinessId;
-        if (resolvedBusinessId)     baseUpdateFields['whatsappConfig.businessId']          = resolvedBusinessId;
+        if (resolvedWabaId) baseUpdateFields['whatsappConfig.businessAccountId'] = resolvedWabaId;
+        if (resolvedPhoneNumberId) baseUpdateFields['whatsappConfig.phoneNumberId'] = resolvedPhoneNumberId;
+        if (resolvedBusinessId) baseUpdateFields['whatsappConfig.businessPortfolioId'] = resolvedBusinessId;
+        if (resolvedBusinessId) baseUpdateFields['whatsappConfig.businessId'] = resolvedBusinessId;
 
         await saveOnboardingLog({
             tenantId,
@@ -3312,7 +3416,7 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
         });
 
         const updatedTenant = await Tenant.findByIdAndUpdate(tenantId, { $set: baseUpdateFields }, { new: true });
-        
+
         await saveOnboardingLog({
             tenantId,
             sessionId,
@@ -3339,7 +3443,7 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
                     null,
                     { params: { access_token: accessToken } }
                 );
-                
+
                 await saveOnboardingLog({
                     tenantId,
                     sessionId,
@@ -3384,7 +3488,7 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
             });
 
             onboardingResult = await processOnboarding(resolvedWabaId, resolvedBusinessId, tenantId, sessionId);
-            
+
             await saveOnboardingLog({
                 tenantId,
                 sessionId,
@@ -3416,17 +3520,17 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
                 : 'Token saved. IDs could not be auto-fetched — please verify in settings.',
             partialConnect: !(finalConfig.phoneNumberId && finalConfig.businessAccountId),
             config: {
-                accessToken:      finalConfig.accessToken,
-                wabaId:           finalConfig.businessAccountId,
-                phoneNumberId:    finalConfig.phoneNumberId,
-                businessId:       finalConfig.businessId,
+                accessToken: finalConfig.accessToken,
+                wabaId: finalConfig.businessAccountId,
+                phoneNumberId: finalConfig.phoneNumberId,
+                businessId: finalConfig.businessId,
                 businessPortfolioId: finalConfig.businessPortfolioId,
-                displayPhone:     finalConfig.displayPhone,
-                verifiedName:     finalConfig.verifiedName,
-                qualityRating:    finalConfig.qualityRating,
-                throughputLevel:  finalConfig.throughputLevel,
-                metaAppId:        appId,
-                verified:         finalConfig.verified,
+                displayPhone: finalConfig.displayPhone,
+                verifiedName: finalConfig.verifiedName,
+                qualityRating: finalConfig.qualityRating,
+                throughputLevel: finalConfig.throughputLevel,
+                metaAppId: appId,
+                verified: finalConfig.verified,
             }
         };
 
@@ -3554,7 +3658,7 @@ app.post('/refresh-meta-account', authenticate, async (req, res) => {
                     null,
                     { params: { access_token: accessToken } }
                 );
-                
+
                 await saveOnboardingLog({
                     tenantId,
                     sessionId,
@@ -3593,16 +3697,16 @@ app.post('/refresh-meta-account', authenticate, async (req, res) => {
         res.json({
             success: true,
             config: {
-                accessToken:        finalConfig.accessToken,
-                wabaId:             finalConfig.businessAccountId,
-                phoneNumberId:      finalConfig.phoneNumberId,
-                businessId:         finalConfig.businessId,
+                accessToken: finalConfig.accessToken,
+                wabaId: finalConfig.businessAccountId,
+                phoneNumberId: finalConfig.phoneNumberId,
+                businessId: finalConfig.businessId,
                 businessPortfolioId: finalConfig.businessPortfolioId,
-                displayPhone:       finalConfig.displayPhone,
-                verifiedName:       finalConfig.verifiedName,
-                qualityRating:      finalConfig.qualityRating,
-                throughputLevel:    finalConfig.throughputLevel,
-                verified:           finalConfig.verified,
+                displayPhone: finalConfig.displayPhone,
+                verifiedName: finalConfig.verifiedName,
+                qualityRating: finalConfig.qualityRating,
+                throughputLevel: finalConfig.throughputLevel,
+                verified: finalConfig.verified,
             }
         });
     } catch (error) {
@@ -4517,9 +4621,7 @@ app.post('/webhook', async (req, res) => {
 
     if (body.object !== 'whatsapp_business_account') return res.sendStatus(404);
 
-    // ── Step 3: Handle account_update PARTNER_ADDED event ───────────────────────
-    // Meta fires this when a business customer completes the Embedded Signup flow.
-    // We must respond 200 first (within 20 seconds), then process asynchronously.
+    // ── Step 3: Handle account_update PARTNER_ADDED event & message_template_status_update ──
     for (const entry of body.entry || []) {
         for (const change of entry.changes || []) {
             const val = change.value;
@@ -4527,7 +4629,7 @@ app.post('/webhook', async (req, res) => {
                 res.sendStatus(200); // Respond immediately to Meta
                 const wabaId = val.waba_id || entry.id;
                 const businessPortfolioId = val.business_portfolio_id || null;
-                
+
                 await saveOnboardingLog({
                     tenantId: null,
                     sessionId: null,
@@ -4551,6 +4653,52 @@ app.post('/webhook', async (req, res) => {
                         message: `Background onboarding triggered by webhook failed: ${err.message}`,
                         details: err.stack
                     });
+                });
+                return; // already sent 200
+            }
+
+            if (change.field === 'message_template_status_update') {
+                res.sendStatus(200); // Respond immediately to Meta
+                const wabaId = entry.id;
+                const templateName = val?.message_template_name;
+                const eventStatus = val?.event; // APPROVED / REJECTED / PENDING / etc.
+                const reason = val?.reason || null;
+                const lang = val?.message_template_language || null;
+
+                console.log(`[Webhook] Template Status Update for WABA ${wabaId}: ${templateName} -> ${eventStatus} (Reason: ${reason})`);
+
+                Tenant.findOne({ 'whatsappConfig.businessAccountId': wabaId }).then(async (tenant) => {
+                    if (tenant) {
+                        const tenantId = tenant._id.toString();
+                        
+                        // Update our local cache of template rejection reasons if template was rejected
+                        if (eventStatus === 'REJECTED' && reason) {
+                            if (!tenant.whatsappConfig.templateRejections) {
+                                tenant.whatsappConfig.templateRejections = new Map();
+                            }
+                            tenant.whatsappConfig.templateRejections.set(templateName, reason);
+                            await tenant.save();
+                        } else if (eventStatus === 'APPROVED') {
+                            // If it's approved, we can remove any existing rejection reason
+                            if (tenant.whatsappConfig.templateRejections) {
+                                tenant.whatsappConfig.templateRejections.delete(templateName);
+                                await tenant.save();
+                            }
+                        }
+
+                        // Emit socket event to notify frontend
+                        io.to(tenantId).emit('template_status_update', {
+                            name: templateName,
+                            status: eventStatus,
+                            reason: reason,
+                            language: lang
+                        });
+                        console.log(`[Webhook] Emitted template_status_update to tenant ${tenantId}`);
+                    } else {
+                        console.warn(`[Webhook] Received template status update for WABA ${wabaId} but no tenant found.`);
+                    }
+                }).catch(err => {
+                    console.error('[Webhook] Error handling template status update:', err);
                 });
                 return; // already sent 200
             }
