@@ -3427,43 +3427,51 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
         });
 
         // Auto-subscribe the WABA to receive webhook events from our app
-        if (resolvedWabaId && accessToken) {
+        // Helper to subscribe a WABA using the most capable token available
+        const subscribeWabaWebhooks = async (wabaId, token, label) => {
             try {
                 await saveOnboardingLog({
                     tenantId,
                     sessionId,
-                    wabaId: resolvedWabaId,
-                    step: 'BACKEND_SUBSCRIBE_WEBHOOKS_START',
+                    wabaId,
+                    step: `BACKEND_SUBSCRIBE_WEBHOOKS_START_${label}`,
                     status: 'info',
-                    message: `Subscribing WABA ${resolvedWabaId} to our app webhooks...`
+                    message: `Subscribing WABA ${wabaId} to our app webhooks using ${label} token...`
                 });
 
+                // Use Authorization header (more reliable than query param for business tokens)
                 await axios.post(
-                    `${WHATSAPP_API_URL}/${resolvedWabaId}/subscribed_apps`,
+                    `${WHATSAPP_API_URL}/${wabaId}/subscribed_apps`,
                     null,
-                    { params: { access_token: accessToken } }
+                    { headers: { Authorization: `Bearer ${token}` } }
                 );
 
                 await saveOnboardingLog({
                     tenantId,
                     sessionId,
-                    wabaId: resolvedWabaId,
-                    step: 'BACKEND_SUBSCRIBE_WEBHOOKS_SUCCESS',
+                    wabaId,
+                    step: `BACKEND_SUBSCRIBE_WEBHOOKS_SUCCESS_${label}`,
                     status: 'success',
-                    message: `Automatically subscribed WABA ${resolvedWabaId} to webhooks successfully.`
+                    message: `Automatically subscribed WABA ${wabaId} to webhooks successfully using ${label} token.`
                 });
+                return true;
             } catch (subErr) {
                 const subErrData = subErr.response?.data || subErr.message;
                 await saveOnboardingLog({
                     tenantId,
                     sessionId,
-                    wabaId: resolvedWabaId,
-                    step: 'BACKEND_SUBSCRIBE_WEBHOOKS_FAIL',
+                    wabaId,
+                    step: `BACKEND_SUBSCRIBE_WEBHOOKS_FAIL_${label}`,
                     status: 'error',
-                    message: `Failed to subscribe WABA to app webhooks.`,
+                    message: `Failed to subscribe WABA to app webhooks using ${label} token.`,
                     details: subErrData
                 });
+                return false;
             }
+        };
+
+        if (resolvedWabaId && accessToken) {
+            await subscribeWabaWebhooks(resolvedWabaId, accessToken, 'USER');
         } else {
             await saveOnboardingLog({
                 tenantId,
@@ -3499,6 +3507,12 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
                 message: 'processOnboarding finished execution.',
                 details: onboardingResult
             });
+
+            // Re-subscribe with permanent business token if processOnboarding got one
+            // This is more reliable than the earlier user token subscription
+            if (onboardingResult?.businessToken && resolvedWabaId) {
+                await subscribeWabaWebhooks(resolvedWabaId, onboardingResult.businessToken, 'PERMANENT_BUSINESS');
+            }
         } else {
             await saveOnboardingLog({
                 tenantId,
