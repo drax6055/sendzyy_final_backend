@@ -63,6 +63,10 @@ const tenantSchema = new mongoose.Schema({
         onboardedAt: Date,              // Timestamp when PARTNER_ADDED webhook fired (Step 3)
         verified: { type: Boolean, default: false },
         templateRejections: { type: Map, of: String, default: {} }, // Map of templateName -> rejectionReason
+        // ── Token health tracking ────────────────────────────────────────────
+        tokenExpiry: { type: Date, default: null },   // null = never expires (system user token)
+        tokenType: { type: String, default: 'user' }, // 'user' | 'system_user'
+        tokenStatus: { type: String, default: 'active', enum: ['active', 'expiring_soon', 'expired', 'unknown'] },
     },
     webhookSecret: { type: String, default: '' },  // AES-256 encrypted hex string
     openaiApiKey: { type: String, default: '' },
@@ -124,6 +128,9 @@ const messageSchema = new mongoose.Schema({
     templateName: { type: String },          // template name for outbound templates
     templateBody: { type: String },          // resolved body text of the template
     interactivePayload: { type: mongoose.Schema.Types.Mixed }, // { type, title, id }
+    wamid: { type: String },                 // WhatsApp message ID from Meta
+    status: { type: String, default: 'sent' }, // 'sent' | 'delivered' | 'read' | 'failed'
+    errorDetails: { type: String },         // Why message failed
 });
 const Message = mongoose.model('Message', messageSchema);
 
@@ -890,6 +897,77 @@ app.post('/api/admin/system-update', (req, res) => {
     return res.json({ success: true, message: 'Broadcast sent to all clients.' });
 });
 
+// ── Admin: Upgrade all existing tenants to permanent never-expiring tokens ──
+// POST /api/admin/regenerate-permanent-tokens
+// Use this once after setting META_SYSTEM_TOKEN to upgrade all tenants who
+// were onboarded with a short-lived user token.
+// Protected by ADMIN_UPDATE_SECRET (same as system-update).
+app.post('/api/admin/regenerate-permanent-tokens', async (req, res) => {
+    const { secret } = req.body;
+    const adminSecret = process.env.ADMIN_UPDATE_SECRET || 'sendzyy-update-secret-9988';
+    if (!secret || secret !== adminSecret) {
+        return res.status(401).json({ error: 'Unauthorized: Invalid secret' });
+    }
+
+    const systemToken = process.env.META_SYSTEM_TOKEN;
+    if (!systemToken || systemToken === 'PASTE_YOUR_SYSTEM_USER_TOKEN_HERE') {
+        return res.status(400).json({
+            error: 'META_SYSTEM_TOKEN is not set in .env. Set it first then call this endpoint.'
+        });
+    }
+
+    // Respond immediately — processing is async
+    res.json({ success: true, message: 'Permanent token regeneration started in background. Check /onboarding-logs for progress.' });
+
+    // Background processing
+    (async () => {
+        const tenants = await Tenant.find({
+            'whatsappConfig.verified': true,
+            'whatsappConfig.businessPortfolioId': { $ne: null, $exists: true },
+        }).select('_id whatsappConfig name email').lean();
+
+        console.log(`[Admin] Starting permanent token regeneration for ${tenants.length} tenants...`);
+
+        let upgraded = 0;
+        let skipped = 0;
+        let failed = 0;
+
+        for (const tenant of tenants) {
+            const cfg = tenant.whatsappConfig;
+
+            // Skip tenants that already have a permanent system_user token
+            if (cfg.tokenType === 'system_user' && !cfg.tokenExpiry) {
+                skipped++;
+                continue;
+            }
+
+            try {
+                const result = await processOnboarding(
+                    cfg.businessAccountId,
+                    cfg.businessPortfolioId,
+                    tenant._id.toString(),
+                    null
+                );
+
+                if (result?.businessToken) {
+                    upgraded++;
+                    console.log(`[Admin] ✅ Upgraded tenant ${tenant._id} (${tenant.email}) to permanent token`);
+                } else {
+                    failed++;
+                    console.warn(`[Admin] ⚠️ Tenant ${tenant._id} (${tenant.email}) — processOnboarding returned no business token`);
+                }
+            } catch (err) {
+                failed++;
+                console.error(`[Admin] ❌ Failed to upgrade tenant ${tenant._id} (${tenant.email}):`, err.message);
+            }
+        }
+
+        console.log(`[Admin] Permanent token regeneration complete. Upgraded: ${upgraded}, Skipped (already permanent): ${skipped}, Failed: ${failed}`);
+    })().catch(err => {
+        console.error('[Admin] Fatal error in regenerate-permanent-tokens:', err.message);
+    });
+});
+
 //  Register — validates only, does NOT save to DB. Returns a short-lived registration token.
 app.post('/register', async (req, res) => {
     const { name, email, password } = req.body;
@@ -1458,6 +1536,32 @@ app.get('/template-rejection-reason/:name', authenticate, async (req, res) => {
         res.json({ name: templateName, reason: savedReason });
     } catch (error) {
         console.error('[TemplateRejectionReason] Error:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// GET /token-status — Returns token health info for the authenticated tenant
+// Used by the frontend to show reconnect banners and warnings
+app.get('/token-status', authenticate, async (req, res) => {
+    try {
+        const tenant = await Tenant.findById(req.user.tenantId).select('whatsappConfig').lean();
+        if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+
+        const cfg = tenant.whatsappConfig || {};
+        const now = new Date();
+        const tokenExpiry = cfg.tokenExpiry ? new Date(cfg.tokenExpiry) : null;
+        const daysLeft = tokenExpiry ? Math.ceil((tokenExpiry - now) / (1000 * 60 * 60 * 24)) : null;
+
+        res.json({
+            tokenStatus: cfg.tokenStatus || 'unknown',     // 'active' | 'expiring_soon' | 'expired' | 'unknown'
+            tokenType: cfg.tokenType || 'user',            // 'user' | 'system_user'
+            tokenExpiry: tokenExpiry ? tokenExpiry.toISOString() : null,
+            daysLeft,                                      // null if never expires
+            verified: cfg.verified || false,
+            needsReconnect: cfg.tokenStatus === 'expired' || !cfg.verified,
+        });
+    } catch (err) {
+        console.error('[GET /token-status] Error:', err.message);
         res.status(500).json({ error: 'Internal Server Error' });
     }
 });
@@ -2121,6 +2225,11 @@ app.post('/send-message', authenticate, async (req, res) => {
                     parameters: [{ type: (mediaType || 'image').toLowerCase(), [(mediaType || 'image').toLowerCase()]: { id: mediaId } }]
                 }];
             }
+        } else if (['image', 'video', 'audio', 'document'].includes(type)) {
+            payload[type] = { id: mediaId };
+            if (type === 'document' && text) {
+                payload.document.filename = text; // optional filename
+            }
         }
 
         const response = await axios.post(
@@ -2210,7 +2319,7 @@ app.post('/send-message', authenticate, async (req, res) => {
 
         // Log outbound chat message
         try {
-            let outboundMessageType = type === 'text' ? 'text' : 'template';
+            let outboundMessageType = type || 'template';
             let outboundTemplateName = null;
             let outboundTemplateBody = null;
 
@@ -2227,7 +2336,7 @@ app.post('/send-message', authenticate, async (req, res) => {
             }
 
             const previewOpts = {
-                text: type === 'text' ? text : undefined,
+                text: ['image', 'video', 'audio', 'document'].includes(type) ? (type === 'document' ? text : '') : (type === 'text' ? text : undefined),
                 templateName: outboundTemplateName,
                 templateBody: outboundTemplateBody,
             };
@@ -2241,12 +2350,15 @@ app.post('/send-message', authenticate, async (req, res) => {
             await Message.create({
                 tenantId,
                 contactId: to,
-                text: type === 'text' ? text : (outboundTemplateBody || ''),
+                text: ['image', 'video', 'audio', 'document'].includes(type) ? (type === 'document' ? text : '') : (type === 'text' ? text : (outboundTemplateBody || '')),
                 isMe: true,
                 time: new Date().toISOString(),
                 messageType: outboundMessageType,
                 templateName: outboundTemplateName,
                 templateBody: outboundTemplateBody,
+                mediaUrl: ['image', 'video', 'audio', 'document'].includes(type) ? mediaId : null,
+                wamid: wamid || null,
+                status: 'sent',
             });
             await broadcastConversations(tenantId);
             await broadcastMessages(tenantId, to);
@@ -2746,12 +2858,15 @@ app.get('/conversations/:contactId/messages', authenticate, async (req, res) => 
             text: m.text || '',
             isMe: m.isMe === true,
             timestamp: m.timestamp,
-            time: m.time || new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            time: formatTimeIST(m.time || m.timestamp),
             messageType: m.messageType || null,
             templateName: m.templateName || null,
             templateBody: m.templateBody || null,
             mediaUrl: m.mediaUrl || null,
             interactivePayload: m.interactivePayload || null,
+            wamid: m.wamid || null,
+            status: m.status || 'sent',
+            errorDetails: m.errorDetails || null,
         })));
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch messages' });
@@ -2900,7 +3015,8 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
                 `https://graph.facebook.com/${apiVersion}/${businessPortfolioId}/system_user_access_tokens`,
                 new URLSearchParams({
                     appsecret_proof: appSecretProof,
-                    fetch_only: 'true',
+                    scope: 'whatsapp_business_management,whatsapp_business_messaging',
+                    set_token_expires_in_60_days: 'false',  // ← KEY: generates a NEVER-EXPIRING token
                 }),
                 {
                     headers: {
@@ -2918,7 +3034,8 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
                 businessPortfolioId,
                 step: 'ONBOARDING_PROCESS_FETCH_TOKEN_SUCCESS',
                 status: 'success',
-                message: 'Step 5: Permanent business system user access token retrieved successfully.'
+                message: 'Step 5: Permanent never-expiring system user access token generated successfully.',
+                details: { tokenType: 'system_user', expires: 'never' }
             });
         } catch (tokenErr) {
             const tokenErrData = tokenErr.response?.data || tokenErr.message;
@@ -2929,7 +3046,7 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
                 businessPortfolioId,
                 step: 'ONBOARDING_PROCESS_FETCH_TOKEN_FAIL',
                 status: 'error',
-                message: 'Step 5: Fetching business system user access token failed. Falling back to system token.',
+                message: 'Step 5: Generating permanent system user access token failed. Falling back to temporary user token.',
                 details: tokenErrData
             });
         }
@@ -3012,6 +3129,10 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
             'whatsappConfig.businessPortfolioId': businessPortfolioId,
             'whatsappConfig.onboardedAt': new Date(),
             'whatsappConfig.verified': !!(businessToken && phoneNumberId),
+            // Token health: system user tokens from this step never expire
+            'whatsappConfig.tokenType': businessToken ? 'system_user' : 'user',
+            'whatsappConfig.tokenExpiry': null,   // null = never expires
+            'whatsappConfig.tokenStatus': 'active',
         };
         if (businessToken) updateFields['whatsappConfig.accessToken'] = businessToken;
         if (phoneNumberId) updateFields['whatsappConfig.phoneNumberId'] = phoneNumberId;
@@ -3179,6 +3300,7 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
 
     try {
         let accessToken = null;
+        let tokenExpiryInfo = {}; // Will be populated after /debug_token call
 
         // Exchange code for access token only if a code was provided
         if (code && code.trim() !== '') {
@@ -3205,6 +3327,36 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
                     status: 'success',
                     message: 'Successfully exchanged auth code for access token.'
                 });
+
+                // ── Inspect token expiry via /debug_token ─────────────────────
+                // User tokens from Embedded Signup code exchange are long-lived (~60 days).
+                // System User tokens (Step 5) can be set to never expire.
+                // We query /debug_token to get the actual expiry and store it.
+                try {
+                    const debugRes = await axios.get(
+                        `https://graph.facebook.com/debug_token`,
+                        { params: { input_token: accessToken, access_token: `${appId}|${appSecret}` } }
+                    );
+                    const tokenData = debugRes.data?.data || {};
+                    const expiresAt = tokenData.expires_at; // Unix timestamp, 0 = never expires
+                    const isNeverExpires = !expiresAt || expiresAt === 0;
+                    const tokenExpiryDate = isNeverExpires ? null : new Date(expiresAt * 1000);
+                    const resolvedTokenType = (tokenData.type === 'SYSTEM_USER' || isNeverExpires) ? 'system_user' : 'user';
+                    // Attach expiry info to tenant update fields (applied below at DB save)
+                    tokenExpiryInfo = { tokenExpiry: tokenExpiryDate, tokenType: resolvedTokenType, tokenStatus: 'active' };
+                    await saveOnboardingLog({
+                        tenantId, sessionId,
+                        step: 'BACKEND_TOKEN_EXPIRY_FETCHED',
+                        status: 'info',
+                        message: isNeverExpires
+                            ? 'Token never expires (system user token).'
+                            : `Token expires at: ${tokenExpiryDate.toISOString()} (type: ${resolvedTokenType})`,
+                        details: { expiresAt, resolvedTokenType }
+                    });
+                } catch (debugErr) {
+                    console.warn('[Embedded Signup] Could not fetch /debug_token:', debugErr.message);
+                    tokenExpiryInfo = { tokenExpiry: null, tokenType: 'user', tokenStatus: 'unknown' };
+                }
             } catch (exErr) {
                 const exErrData = exErr.response?.data || exErr.message;
                 await saveOnboardingLog({
@@ -3397,6 +3549,10 @@ app.post('/facebook-embedded-signup', authenticate, async (req, res) => {
             'whatsappConfig.accessToken': accessToken,
             'whatsappConfig.metaAppId': appId,
             'whatsappConfig.verified': !!(accessToken && resolvedWabaId && resolvedPhoneNumberId),
+            // Token health fields from /debug_token inspection
+            'whatsappConfig.tokenExpiry': tokenExpiryInfo.tokenExpiry ?? null,
+            'whatsappConfig.tokenType': tokenExpiryInfo.tokenType || 'user',
+            'whatsappConfig.tokenStatus': tokenExpiryInfo.tokenStatus || 'active',
         };
         if (resolvedWabaId) baseUpdateFields['whatsappConfig.businessAccountId'] = resolvedWabaId;
         if (resolvedPhoneNumberId) baseUpdateFields['whatsappConfig.phoneNumberId'] = resolvedPhoneNumberId;
@@ -3768,11 +3924,24 @@ app.post('/upload-media', authenticate, async (req, res) => {
     const { name, size, type, accessToken, appId } = req.query;
     const fileData = req.body;
     try {
+        let processedFileData = fileData;
+        if (Buffer.isBuffer(fileData)) {
+            const str = fileData.toString('utf8').trim();
+            if (str.startsWith('[') && str.endsWith(']')) {
+                try {
+                    const parsed = JSON.parse(str);
+                    if (Array.isArray(parsed)) {
+                        processedFileData = Buffer.from(parsed);
+                    }
+                } catch (_) {}
+            }
+        }
+
         const initResponse = await axios.post(`${WHATSAPP_API_URL}/${appId}/uploads`, null, {
             params: { file_name: name, file_length: parseInt(size), file_type: type, access_token: accessToken }
         });
         const sessionId = initResponse.data.id;
-        const uploadResponse = await axios.post(`${WHATSAPP_API_URL}/${sessionId}`, fileData, {
+        const uploadResponse = await axios.post(`${WHATSAPP_API_URL}/${sessionId}`, processedFileData, {
             headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/octet-stream', file_offset: '0' }
         });
         res.json({ h: uploadResponse.data.h });
@@ -3786,10 +3955,23 @@ app.post('/media-upload', authenticate, async (req, res) => {
     const { phoneNumberId, accessToken, fileName, fileType } = req.query;
     const fileData = req.body;
     try {
+        let processedFileData = fileData;
+        if (Buffer.isBuffer(fileData)) {
+            const str = fileData.toString('utf8').trim();
+            if (str.startsWith('[') && str.endsWith(']')) {
+                try {
+                    const parsed = JSON.parse(str);
+                    if (Array.isArray(parsed)) {
+                        processedFileData = Buffer.from(parsed);
+                    }
+                } catch (_) {}
+            }
+        }
+
         const FormData = require('form-data');
         const form = new FormData();
         form.append('messaging_product', 'whatsapp');
-        form.append('file', fileData, { filename: fileName, contentType: fileType });
+        form.append('file', processedFileData, { filename: fileName, contentType: fileType });
         const response = await axios.post(
             `${WHATSAPP_API_URL}/${phoneNumberId}/media`,
             form,
@@ -3798,6 +3980,7 @@ app.post('/media-upload', authenticate, async (req, res) => {
         res.json({ id: response.data.id });
     } catch (error) {
         const errorData = error.response?.data || error.message;
+        console.error('[Media Upload proxy error]:', JSON.stringify(errorData, null, 2));
         res.status(error.response?.status || 500).json({ error: { message: 'Failed to proxy standard media upload', details: errorData } });
     }
 });
@@ -3822,14 +4005,100 @@ function withContactLock(lockKey, fn) {
     return next;
 }
 
-// Task 2.14 — handle Meta API 401: deactivate all tenant chatbots + emit socket event
+// Task 2.14 — handle Meta API 401: deactivate all tenant chatbots, mark token expired, notify tenant
 async function handleMetaAuth401(tenantId) {
     try {
+        // 1. Deactivate all chatbots for this tenant
         await Chatbot.updateMany({ tenantId }, { $set: { isActive: false } });
+
+        // 2. Mark token as expired in DB so the UI can show a reconnect banner
+        await Tenant.findByIdAndUpdate(tenantId, {
+            'whatsappConfig.verified': false,
+            'whatsappConfig.tokenStatus': 'expired',
+        });
+
+        // 3. Emit socket events to live dashboard
         io.to(tenantId).emit('chatbot_auth_error', { tenantId });
-        console.error(` [ChatbotEngine] 401 from Meta API — deactivated all chatbots for tenant ${tenantId}`);
+        io.to(tenantId).emit('token_expired', {
+            tenantId,
+            message: 'Your WhatsApp access token has expired or been revoked. Please reconnect your account.',
+            action: 'reconnect'
+        });
+
+        // 4. Send email notification (best-effort, non-blocking)
+        Tenant.findById(tenantId).then(tenant => {
+            if (tenant?.email) {
+                transporter.sendMail({
+                    from: `"Sendzyy" <${process.env.EMAIL_USER}>`,
+                    to: tenant.email,
+                    subject: '⚠️ Action Required — Reconnect Your WhatsApp Account | Sendzyy',
+                    html: `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#fff8f0;font-family:'Segoe UI',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#fff8f0;padding:40px 0;">
+<tr><td align="center">
+<table width="560" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+  <tr>
+    <td style="background:linear-gradient(135deg,#E65100 0%,#F57C00 60%,#FF9800 100%);padding:40px 48px;text-align:center;">
+      <span style="font-size:48px;">⚠️</span>
+      <h1 style="margin:16px 0 8px;color:#fff;font-size:26px;font-weight:700;">WhatsApp Token Expired</h1>
+      <p style="margin:0;color:rgba(255,255,255,0.85);font-size:14px;">Your WhatsApp connection needs to be refreshed</p>
+    </td>
+  </tr>
+  <tr>
+    <td style="padding:36px 48px;">
+      <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.7;">
+        Hello <strong>${tenant.name}</strong>,<br><br>
+        Your WhatsApp Business access token has <strong>expired or been revoked</strong>. This means:
+      </p>
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px;">
+        <tr><td style="background:#fff3e0;border-left:4px solid #FF9800;border-radius:0 8px 8px 0;padding:12px 16px;color:#795548;font-size:14px;">
+          📵 Messages will not be sent or received until you reconnect
+        </td></tr>
+      </table>
+      <p style="margin:0 0 24px;color:#555;font-size:15px;line-height:1.7;">
+        To fix this, go to your Sendzyy dashboard and click <strong>"Connect WhatsApp"</strong> to re-run the connection flow. It only takes 2 minutes.
+      </p>
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+        <tr><td align="center">
+          <a href="https://app.sendzyy.com" target="_blank"
+             style="display:inline-block;background:linear-gradient(135deg,#E65100,#FF9800);color:#fff;text-decoration:none;font-size:16px;font-weight:700;padding:16px 48px;border-radius:50px;letter-spacing:0.5px;box-shadow:0 4px 14px rgba(230,81,0,0.4);">
+            🔗 &nbsp; Reconnect WhatsApp Now
+          </a>
+        </td></tr>
+      </table>
+      <table width="100%" cellpadding="0" cellspacing="0">
+        <tr><td style="background:#f9f9f9;border-radius:10px;padding:16px 20px;">
+          <p style="margin:0;color:#888;font-size:13px;line-height:1.6;">
+            💡 <strong>Why does this happen?</strong><br>
+            Meta WhatsApp access tokens expire after ~60 days. To avoid this in the future, 
+            contact Sendzyy support to upgrade to a permanent System User Token that never expires.
+          </p>
+        </td></tr>
+      </table>
+    </td>
+  </tr>
+  <tr>
+    <td style="background:#f5f5f5;border-top:1px solid #eee;padding:24px 48px;text-align:center;">
+      <p style="margin:0;color:#1B5E20;font-size:14px;font-weight:700;">Sendzyy</p>
+      <p style="margin:4px 0 0;color:#aaa;font-size:12px;">© ${new Date().getFullYear()} Sendzyy · <a href="https://app.sendzyy.com" style="color:#4CAF50;text-decoration:none;">app.sendzyy.com</a></p>
+    </td>
+  </tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>`,
+                }).catch(emailErr => {
+                    console.error(`[handleMetaAuth401] Email notification failed for tenant ${tenantId}:`, emailErr.message);
+                });
+            }
+        }).catch(() => {});
+
+        console.error(` [Auth401] Token expired for tenant ${tenantId} — chatbots deactivated, token marked expired, notification sent.`);
     } catch (err) {
-        console.error(` [ChatbotEngine] handleMetaAuth401 error:`, err.message);
+        console.error(` [handleMetaAuth401] error:`, err.message);
     }
 }
 
@@ -4542,6 +4811,21 @@ setInterval(async () => {
  * @param {string} [opts.interactiveTitle] - Button/list reply title (for 'interactive' type)
  * @returns {string}
  */
+function formatTimeIST(dateVal) {
+    if (!dateVal) return '';
+    try {
+        const d = new Date(dateVal);
+        if (isNaN(d.getTime())) return '';
+        // Add 5.5 hours to convert UTC to IST (UTC+5:30)
+        const istDate = new Date(d.getTime() + (5.5 * 3600000));
+        const hours = String(istDate.getUTCHours()).padStart(2, '0');
+        const minutes = String(istDate.getUTCMinutes()).padStart(2, '0');
+        return `${hours}:${minutes}`;
+    } catch (err) {
+        return '';
+    }
+}
+
 function buildPreview(messageType, opts = {}) {
     const truncate = (str, max = 80) => (str && str.length > max ? str.substring(0, max) + '…' : str || '');
 
@@ -4770,6 +5054,15 @@ app.post('/webhook', async (req, res) => {
 
             const mapping = await StatusMapping.findOne({ wamid });
             if (mapping?.tenantId) {
+                // Update Message delivery status and details in DB
+                const messageUpdate = { status };
+                if (statusUpdate.errors && statusUpdate.errors.length > 0) {
+                    const err = statusUpdate.errors[0];
+                    messageUpdate.errorDetails = err.error_data?.details || err.message || err.title || 'Unknown Meta error';
+                }
+                await Message.findOneAndUpdate({ wamid }, { $set: messageUpdate });
+                await broadcastMessages(mapping.tenantId, mapping.to);
+
                 if (mapping.campaignId) {
                     const inc = {};
                     if (status === 'delivered') inc.deliveredCount = 1;
@@ -4917,7 +5210,7 @@ io.on('connection', (socket) => {
                     text: m.text || "",
                     isMe: m.isMe === true,
                     timestamp: m.timestamp,
-                    time: m.time || new Date(m.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+                    time: formatTimeIST(m.time || m.timestamp),
                     messageType: m.messageType || null,
                     templateName: m.templateName || null,
                     templateBody: m.templateBody || null,
@@ -4962,12 +5255,15 @@ async function broadcastMessages(tenantId, contactId) {
                 text: m.text || "",
                 isMe: m.isMe === true,
                 timestamp: m.timestamp,
-                time: m.time || new Date(m.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+                time: formatTimeIST(m.time || m.timestamp),
                 messageType: m.messageType || null,
                 templateName: m.templateName || null,
                 templateBody: m.templateBody || null,
                 mediaUrl: m.mediaUrl || null,
                 interactivePayload: m.interactivePayload || null,
+                wamid: m.wamid || null,
+                status: m.status || 'sent',
+                errorDetails: m.errorDetails || null,
             };
         });
         io.to(tenantId).emit("messages_" + contactId, formatted);
@@ -5007,8 +5303,41 @@ async function runScheduledCampaigns() {
                 continue;
             }
             const campaignId = `sched_${sc._id}`;
+
+            // Build campaign creation fields (captures retry config snapshot)
+            let lifecycleFields = {};
+            try {
+                lifecycleFields = await campaignLifecycleManager.buildCampaignCreationFields(sc.tenantId);
+            } catch (err) {
+                console.warn(`[ScheduledCampaign] Failed to build lifecycle fields: ${err.message}`);
+                lifecycleFields = {
+                    retryConfig: { version: 0, phases: [] },
+                    status: 'initial',
+                    currentPhase: 1,
+                    phaseStats: [{ phaseNumber: 1, successCount: 0, failureCount: 0, executedAt: new Date() }]
+                };
+            }
+
+            // Create initial Campaign document so it appears in reporting immediately
+            await Campaign.create({
+                tenantId: sc.tenantId,
+                id: campaignId,
+                template: sc.template,
+                timestamp: sc.scheduledAt || new Date(),
+                dispatchedAt: new Date(),
+                totalCount: sc.recipients.length,
+                successCount: 0,
+                failureCount: 0,
+                ...lifecycleFields
+            });
+
             let success = 0, failure = 0;
             for (const recipient of sc.recipients) {
+                const to = recipient.mobileNumber || recipient.to;
+                if (!to) {
+                    failure++;
+                    continue;
+                }
                 try {
                     const components = [];
                     if (sc.mediaId && sc.mediaType) {
@@ -5018,17 +5347,74 @@ async function runScheduledCampaigns() {
                     const bodyParams = Object.keys(vars).sort().map(k => ({ type: 'text', text: vars[k] }));
                     if (bodyParams.length) components.push({ type: 'body', parameters: bodyParams });
                     const payload = {
-                        messaging_product: 'whatsapp', to: recipient.mobileNumber, type: 'template',
+                        messaging_product: 'whatsapp', to, type: 'template',
                         template: { name: sc.template, language: { code: sc.language || 'en_US' }, ...(components.length ? { components } : {}) }
                     };
                     const resp = await axios.post(`${WHATSAPP_API_URL}/${config.phoneNumberId}/messages`, payload, {
                         headers: { Authorization: `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' }
                     });
-                    if (resp.data?.messages?.[0]?.id) {
+                    const wamid = resp.data?.messages?.[0]?.id;
+                    if (wamid) {
                         success++;
-                    } else { failure++; }
-                } catch { failure++; }
+                        // Persist Recipient document
+                        await Recipient.create({
+                            tenantId: sc.tenantId,
+                            campaignId,
+                            wamid,
+                            to,
+                            status: 'sent',
+                            sentAt: new Date().toISOString(),
+                            phaseNumber: null,
+                            retryHistory: []
+                        });
+                        // Persist StatusMapping for webhook delivery tracking
+                        await StatusMapping.findOneAndUpdate(
+                            { wamid },
+                            { wamid, tenantId: sc.tenantId, campaignId, to },
+                            { upsert: true }
+                        );
+                    } else {
+                        failure++;
+                        await Recipient.create({
+                            tenantId: sc.tenantId,
+                            campaignId,
+                            wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                            to,
+                            status: 'failed',
+                            failedAt: new Date().toISOString(),
+                            phaseNumber: null,
+                            retryHistory: []
+                        });
+                    }
+                } catch (sendErr) {
+                    failure++;
+                    await Recipient.create({
+                        tenantId: sc.tenantId,
+                        campaignId,
+                        wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                        to,
+                        status: 'failed',
+                        failedAt: new Date().toISOString(),
+                        phaseNumber: null,
+                        retryHistory: []
+                    });
+                }
             }
+
+            // Update Campaign final counts
+            await Campaign.updateOne(
+                { id: campaignId },
+                {
+                    $set: {
+                        successCount: success,
+                        failureCount: failure
+                    }
+                }
+            );
+
+            // Emit progress updates to active dashboard rooms
+            await broadcastCampaigns(sc.tenantId);
+
             await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'completed', resultCampaignId: campaignId, successCount: success, failureCount: failure } });
             console.log(` Scheduled campaign ${sc._id} completed: ${success} sent, ${failure} failed`);
         }
@@ -5412,9 +5798,23 @@ async function dispatchTemplate(tenantId, lead, trigger) {
     }
 
     try {
-        await axios.post(url, body, {
+        const response = await axios.post(url, body, {
             headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
         });
+        const wamid = response.data.messages?.[0]?.id || null;
+
+        if (wamid) {
+            try {
+                await StatusMapping.findOneAndUpdate(
+                    { wamid },
+                    { wamid, tenantId, to: lead.mobileNumber },
+                    { upsert: true }
+                );
+            } catch (err) {
+                console.error('AutoTrigger StatusMapping creation failed:', err.message);
+            }
+        }
+
         // 7.4 — Update status to contacted on success
         await Lead.findByIdAndUpdate(lead._id, { status: 'contacted' });
 
@@ -5439,6 +5839,8 @@ async function dispatchTemplate(tenantId, lead, trigger) {
             messageType: 'template',
             templateName: trigger.templateName,
             templateBody: templateBodyText,
+            wamid: wamid,
+            status: 'sent',
         });
         await broadcastConversations(tenantId);
         await broadcastMessages(tenantId, lead.mobileNumber);
@@ -5613,6 +6015,8 @@ async function evaluateClientTrigger(tenantId, client) {
             role: 'assistant',
             type: 'template',
             time: new Date().toISOString(),
+            wamid: wamid || null,
+            status: 'sent',
         });
         await broadcastConversations(tenantId);
         await broadcastMessages(tenantId, client.mobileNumber);
@@ -6228,11 +6632,12 @@ httpServer.listen(PORT, async () => {
         console.warn(' Could not clean up RetryConfiguration index:', err.message);
     }
 
-    // ── Retry Scheduler: startup recovery + cron job (Tasks 13.1 & 13.2) ──────
+    // ── Retry Scheduler + Token Expiry Watcher (Tasks 13.1, 13.2 & Token Health) ──
     try {
         const { initScheduler } = require('./scheduler');
-        await initScheduler(retryScheduler, ScheduledRetryPhase);
+        await initScheduler(retryScheduler, ScheduledRetryPhase, Tenant, transporter, io);
         console.log(' Retry scheduler initialised (cron: every minute)');
+        console.log(' Token expiry watcher initialised (cron: daily at 9:00 AM)');
     } catch (err) {
         console.error(' Failed to initialise retry scheduler:', err.message, err.stack);
     }
