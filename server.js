@@ -4128,6 +4128,16 @@ async function sendChatbotText(tenant, to, text, chatbotId) {
     } catch (err) {
         if (err.response?.status === 401) await handleMetaAuth401(tenantId);
         console.error(` [ChatbotEngine] sendChatbotText API error:`, err.response?.data || err.message);
+        const errorDetails = err.response?.data?.error?.message || err.message;
+        saveChatbotMessageToDB({
+            tenantId,
+            contactId: to,
+            text: `⚠️ Chatbot failed to send message: ${errorDetails}`,
+            isMe: true,
+            messageType: 'text',
+            source: 'chatbot',
+            previewText: '⚠️ Failed to send message',
+        }).catch(() => {});
         return false; // WhatsApp send failed — do not advance the flow
     }
 
@@ -4571,6 +4581,16 @@ async function handleQuickReplyNode(session, node, tenant, from) {
     } catch (err) {
         if (err.response?.status === 401) await handleMetaAuth401(tenant._id.toString());
         console.error(` [ChatbotEngine] quickReply send error:`, err.response?.data || err.message);
+        const errorDetails = err.response?.data?.error?.message || err.message;
+        saveChatbotMessageToDB({
+            tenantId: tenant._id.toString(),
+            contactId: from,
+            text: `⚠️ Chatbot failed to send interactive buttons: ${errorDetails}`,
+            isMe: true,
+            messageType: 'text',
+            source: 'chatbot',
+            previewText: '⚠️ Failed to send buttons',
+        }).catch(() => {});
         return; // WhatsApp API failed — do not set session state
     }
 }
@@ -4675,6 +4695,16 @@ async function handleListMessageNode(session, node, tenant, from) {
     } catch (err) {
         if (err.response?.status === 401) await handleMetaAuth401(tenant._id.toString());
         console.error(` [ChatbotEngine] listMessage send error:`, JSON.stringify(err.response?.data || err.message));
+        const errorDetails = err.response?.data?.error?.message || err.message;
+        saveChatbotMessageToDB({
+            tenantId: tenant._id.toString(),
+            contactId: from,
+            text: `⚠️ Chatbot failed to send list menu: ${errorDetails}`,
+            isMe: true,
+            messageType: 'text',
+            source: 'chatbot',
+            previewText: '⚠️ Failed to send list menu',
+        }).catch(() => {});
         return; // WhatsApp API failed — do not set session state
     }
 }
@@ -4801,7 +4831,19 @@ async function handleActionNode(session, node, tenant, from) {
             } catch (err) {
                 if (err.response?.status === 401) await handleMetaAuth401(tenantId);
                 console.error(` [ChatbotEngine] send_template error:`, err.response?.data || err.message);
-                return;
+                const errorDetails = err.response?.data?.error?.error_data?.details || 
+                                     err.response?.data?.error?.message || 
+                                     err.message;
+                saveChatbotMessageToDB({
+                    tenantId,
+                    contactId: from,
+                    text: `⚠️ Chatbot failed to send template "${templateName}": ${errorDetails}`,
+                    isMe: true,
+                    messageType: 'text',
+                    source: 'chatbot',
+                    previewText: `⚠️ Failed to send template: ${templateName}`,
+                }).catch(() => {});
+                // Do not return — allow flow to advance so session doesn't get stuck
             }
         }
     } else if (subType === 'end_session') {
