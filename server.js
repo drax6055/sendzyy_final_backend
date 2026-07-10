@@ -1929,6 +1929,20 @@ app.delete('/api/clients/trigger', authenticate, async (req, res) => {
     }
 });
 
+app.post('/api/clients/bulk-delete', authenticate, async (req, res) => {
+    try {
+        const { ids } = req.body;
+        if (!ids || !Array.isArray(ids)) {
+            return res.status(400).json({ error: 'Client IDs must be an array' });
+        }
+        await Client.deleteMany({ _id: { $in: ids }, tenantId: req.user.tenantId });
+        res.json({ success: true, message: 'Clients deleted successfully' });
+    } catch (error) {
+        console.error('[server] POST /api/clients/bulk-delete error:', error);
+        res.status(500).json({ error: 'Failed to delete clients' });
+    }
+});
+
 app.delete('/api/clients/:id', authenticate, async (req, res) => {
     try {
         const client = await Client.findOneAndDelete({ _id: req.params.id, tenantId: req.user.tenantId });
