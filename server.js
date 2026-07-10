@@ -577,7 +577,13 @@ const httpServer = http.createServer(app);
 const io = new Server(httpServer, { cors: { origin: '*' } });
 SocketEmitter.setIo(io);
 app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.raw({ type: 'application/octet-stream', limit: '50mb' }));
+app.use(bodyParser.raw({
+    type: (req) => {
+        const contentType = req.headers['content-type'] || '';
+        return contentType.toLowerCase().includes('application/octet-stream');
+    },
+    limit: '50mb'
+}));
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'whatsapp_bulk_verify_token_123';
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v25.0';
@@ -2331,6 +2337,17 @@ app.post('/send-message', authenticate, async (req, res) => {
                     const tplComponents = await fetchTemplateComponents(tenant, template.name);
                     const bodyComponent = (tplComponents || []).find(c => c.type === 'BODY');
                     outboundTemplateBody = bodyComponent?.text || null;
+                    if (outboundTemplateBody && template.components) {
+                        const bodyPart = template.components.find(c => c.type.toLowerCase() === 'body');
+                        if (bodyPart && Array.isArray(bodyPart.parameters)) {
+                            bodyPart.parameters.forEach((param, idx) => {
+                                outboundTemplateBody = outboundTemplateBody.replace(
+                                    new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g'),
+                                    param.text || ''
+                                );
+                            });
+                        }
+                    }
                 } catch (_) {
                     outboundTemplateBody = null;
                 }
@@ -3927,17 +3944,19 @@ app.post('/upload-media', authenticate, async (req, res) => {
     const { name, size, type, accessToken, appId } = req.query;
     const fileData = req.body;
     try {
+        if (!fileData || !Buffer.isBuffer(fileData)) {
+            console.error('[Upload Media Error]: req.body is not a buffer. Content-Type:', req.headers['content-type']);
+            return res.status(400).json({ error: { message: 'Invalid file data. Expected binary stream.' } });
+        }
         let processedFileData = fileData;
-        if (Buffer.isBuffer(fileData)) {
-            const str = fileData.toString('utf8').trim();
-            if (str.startsWith('[') && str.endsWith(']')) {
-                try {
-                    const parsed = JSON.parse(str);
-                    if (Array.isArray(parsed)) {
-                        processedFileData = Buffer.from(parsed);
-                    }
-                } catch (_) {}
-            }
+        const str = fileData.toString('utf8').trim();
+        if (str.startsWith('[') && str.endsWith(']')) {
+            try {
+                const parsed = JSON.parse(str);
+                if (Array.isArray(parsed)) {
+                    processedFileData = Buffer.from(parsed);
+                }
+            } catch (_) {}
         }
 
         const initResponse = await axios.post(`${WHATSAPP_API_URL}/${appId}/uploads`, null, {
@@ -3958,17 +3977,19 @@ app.post('/media-upload', authenticate, async (req, res) => {
     const { phoneNumberId, accessToken, fileName, fileType } = req.query;
     const fileData = req.body;
     try {
+        if (!fileData || !Buffer.isBuffer(fileData)) {
+            console.error('[Media Upload Error]: req.body is not a buffer. Content-Type:', req.headers['content-type']);
+            return res.status(400).json({ error: { message: 'Invalid file data. Expected binary stream.' } });
+        }
         let processedFileData = fileData;
-        if (Buffer.isBuffer(fileData)) {
-            const str = fileData.toString('utf8').trim();
-            if (str.startsWith('[') && str.endsWith(']')) {
-                try {
-                    const parsed = JSON.parse(str);
-                    if (Array.isArray(parsed)) {
-                        processedFileData = Buffer.from(parsed);
-                    }
-                } catch (_) {}
-            }
+        const str = fileData.toString('utf8').trim();
+        if (str.startsWith('[') && str.endsWith(']')) {
+            try {
+                const parsed = JSON.parse(str);
+                if (Array.isArray(parsed)) {
+                    processedFileData = Buffer.from(parsed);
+                }
+            } catch (_) {}
         }
 
         const FormData = require('form-data');
@@ -4196,6 +4217,7 @@ async function saveChatbotMessageToDB({
     source,
     interactivePayload = null,
     templateName = null,
+    templateBody = null,
     wamid = null,
     previewText,
     name = null,
@@ -4217,9 +4239,23 @@ async function saveChatbotMessageToDB({
         source,
         interactivePayload,
         templateName,
+        templateBody,
         wamid,
         status: isMe ? 'sent' : undefined,
     });
+
+    // Create/update StatusMapping for delivery tracking
+    if (wamid && isMe) {
+        try {
+            await StatusMapping.findOneAndUpdate(
+                { wamid },
+                { wamid, tenantId, to: contactId },
+                { upsert: true }
+            );
+        } catch (err) {
+            console.error('[ChatbotEngine] StatusMapping creation failed:', err.message);
+        }
+    }
 
     // 2. Update conversation preview
     const convUpdate = {
@@ -4581,7 +4617,7 @@ async function handleQuickReplyNode(session, node, tenant, from) {
     } catch (err) {
         if (err.response?.status === 401) await handleMetaAuth401(tenant._id.toString());
         console.error(` [ChatbotEngine] quickReply send error:`, err.response?.data || err.message);
-        const errorDetails = err.response?.data?.error?.message || err.message;
+        const errorDetails = getMetaErrorDetails(err);
         saveChatbotMessageToDB({
             tenantId: tenant._id.toString(),
             contactId: from,
@@ -4695,7 +4731,7 @@ async function handleListMessageNode(session, node, tenant, from) {
     } catch (err) {
         if (err.response?.status === 401) await handleMetaAuth401(tenant._id.toString());
         console.error(` [ChatbotEngine] listMessage send error:`, JSON.stringify(err.response?.data || err.message));
-        const errorDetails = err.response?.data?.error?.message || err.message;
+        const errorDetails = getMetaErrorDetails(err);
         saveChatbotMessageToDB({
             tenantId: tenant._id.toString(),
             contactId: from,
@@ -4815,25 +4851,39 @@ async function handleActionNode(session, node, tenant, from) {
                 );
                 const _tmWamid = _tmResp.data?.messages?.[0]?.id || null;
 
+                let resolvedBody = null;
+                try {
+                    const tplComponents = await fetchTemplateComponents(tenant, templateName);
+                    const bodyComponent = (tplComponents || []).find(c => c.type === 'BODY');
+                    const templateBodyText = bodyComponent?.text || null;
+                    resolvedBody = templateBodyText;
+                    if (resolvedBody && Array.isArray(variables)) {
+                        variables.forEach((val, idx) => {
+                            resolvedBody = resolvedBody.replace(new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g'), String(val));
+                        });
+                    }
+                } catch (e) {
+                    console.error('[ChatbotEngine] fetchTemplateComponents error in handleActionNode:', e.message);
+                }
+
                 // Persist the bot template message to DB so tenant can see it
                 saveChatbotMessageToDB({
                     tenantId,
                     contactId: from,
-                    text: `📋 Template: ${templateName}`,
+                    text: resolvedBody || `📋 Template: ${templateName}`,
                     isMe: true,
                     messageType: 'template',
                     source: 'chatbot',
                     templateName,
+                    templateBody: resolvedBody,
                     wamid: _tmWamid,
-                    previewText: `📋 Template: ${templateName}`,
+                    previewText: resolvedBody ? `🤖 ${resolvedBody}` : `🤖 Template: ${templateName}`,
                 }).catch(e => console.error('[ChatbotEngine] handleActionNode send_template DB error:', e.message));
 
             } catch (err) {
                 if (err.response?.status === 401) await handleMetaAuth401(tenantId);
                 console.error(` [ChatbotEngine] send_template error:`, err.response?.data || err.message);
-                const errorDetails = err.response?.data?.error?.error_data?.details || 
-                                     err.response?.data?.error?.message || 
-                                     err.message;
+                const errorDetails = getMetaErrorDetails(err);
                 saveChatbotMessageToDB({
                     tenantId,
                     contactId: from,
@@ -5131,6 +5181,21 @@ setInterval(async () => {
         console.error(` [ChatbotEngine] Session expiry error:`, err.message);
     }
 }, 60 * 1000);
+
+function getMetaErrorDetails(err) {
+    if (!err) return 'Unknown error';
+    if (err.response?.data) {
+        const data = err.response.data;
+        if (Array.isArray(data.errors) && data.errors.length > 0) {
+            const firstErr = data.errors[0];
+            return firstErr.error_data?.details || firstErr.message || firstErr.title || err.message;
+        }
+        if (data.error) {
+            return data.error.error_data?.details || data.error.message || err.message;
+        }
+    }
+    return err.message || 'Unknown error';
+}
 
 // ─── End Chatbot Engine ───────────────────────────────────────────────────────
 
@@ -6166,7 +6231,12 @@ async function dispatchTemplate(tenantId, lead, trigger) {
         // Store outbound template message so it appears in the conversation/chat screen
         // Extract template body text from the already-fetched components
         const bodyComponent = (components || []).find(c => c.type === 'BODY');
-        const templateBodyText = bodyComponent?.text || null;
+        let templateBodyText = bodyComponent?.text || null;
+        if (templateBodyText && bodyParams && bodyParams.length) {
+            bodyParams.forEach((param, idx) => {
+                templateBodyText = templateBodyText.replace(new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g'), param.text || '');
+            });
+        }
         const contactName = lead.name || lead.mobileNumber;
         const previewText = buildPreview('template', { templateName: trigger.templateName, templateBody: templateBodyText });
 
@@ -6178,7 +6248,7 @@ async function dispatchTemplate(tenantId, lead, trigger) {
         await Message.create({
             tenantId,
             contactId: lead.mobileNumber,
-            text: templateBodyText || '',
+            text: templateBodyText || `📋 Template: ${trigger.templateName}`,
             isMe: true,
             time: new Date().toISOString(),
             messageType: 'template',
@@ -6345,7 +6415,14 @@ async function evaluateClientTrigger(tenantId, client) {
         }
 
         // Step 6: Upsert Conversation and create Message document
-        const templateLabel = `📋 Template: ${trigger.templateName}`;
+        const bodyComponent = (tplComponents || []).find(c => c.type === 'BODY');
+        let templateBodyText = bodyComponent?.text || null;
+        if (templateBodyText && bodyParams && bodyParams.length) {
+            bodyParams.forEach((param, idx) => {
+                templateBodyText = templateBodyText.replace(new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g'), param.text || '');
+            });
+        }
+        const templateLabel = templateBodyText || `📋 Template: ${trigger.templateName}`;
         const contactName = client.name || client.mobileNumber;
         await Conversation.findOneAndUpdate(
             { tenantId, contactId: client.mobileNumber },
@@ -6357,8 +6434,9 @@ async function evaluateClientTrigger(tenantId, client) {
             contactId: client.mobileNumber,
             text: templateLabel,
             isMe: true,
-            role: 'assistant',
-            type: 'template',
+            messageType: 'template',
+            templateName: trigger.templateName,
+            templateBody: templateBodyText,
             time: new Date().toISOString(),
             wamid: wamid || null,
             status: 'sent',
