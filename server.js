@@ -516,6 +516,53 @@ const messageSenderAdapter = {
             }
         );
 
+        // Log the retry-phase outbound message so it appears in the conversation/chat screen
+        try {
+            let retryTemplateBody = '';
+            try {
+                const tplComponents = await fetchTemplateComponents(tenant, campaign.template);
+                const bodyComponent = (tplComponents || []).find(c => c.type === 'BODY');
+                retryTemplateBody = bodyComponent?.text || '';
+            } catch (_) { /* non-fatal — fall back to empty body */ }
+
+            const retryPreview = buildPreview('template', {
+                templateName: campaign.template,
+                templateBody: retryTemplateBody,
+            });
+
+            await Conversation.findOneAndUpdate(
+                { tenantId: campaign.tenantId, contactId: recipient.to },
+                {
+                    name: recipient.to,
+                    lastMessage: retryPreview,
+                    lastActive: new Date(),
+                    $setOnInsert: { hasReply: false }
+                },
+                { upsert: true }
+            );
+
+            await Message.create({
+                tenantId: campaign.tenantId,
+                contactId: recipient.to,
+                text: retryTemplateBody || `📋 Template: ${campaign.template}`,
+                isMe: true,
+                time: new Date().toISOString(),
+                messageType: 'template',
+                templateName: campaign.template,
+                templateBody: retryTemplateBody,
+                wamid: wamid,
+                status: 'sent',
+            });
+
+            await broadcastConversations(campaign.tenantId);
+            await broadcastMessages(campaign.tenantId, recipient.to);
+        } catch (msgErr) {
+            console.error(
+                `[messageSender] Failed to create Message/Conversation log for retry phase ${phaseNumber} ` +
+                `to ${recipient.to}: ${msgErr.message}`
+            );
+        }
+
         console.log(
             `[messageSender] Sent retry phase ${phaseNumber} message to ${recipient.to} ` +
             `(campaign ${campaign.id}, wamid ${wamid})`
@@ -5318,6 +5365,16 @@ async function runScheduledCampaigns() {
                 };
             }
 
+            // Fetch template components to resolve body text for message logging
+            let templateBodyText = '';
+            try {
+                const components = await fetchTemplateComponents(tenant, sc.template);
+                const bodyComponent = (components || []).find(c => c.type === 'BODY');
+                templateBodyText = bodyComponent?.text || '';
+            } catch (err) {
+                console.error(`[ScheduledCampaign] Failed to fetch template components: ${err.message}`);
+            }
+
             // Create initial Campaign document so it appears in reporting immediately
             await Campaign.create({
                 tenantId: sc.tenantId,
@@ -5373,6 +5430,43 @@ async function runScheduledCampaigns() {
                             { wamid, tenantId: sc.tenantId, campaignId, to },
                             { upsert: true }
                         );
+
+                        // Log outbound template message so it appears in the conversation/chat screen
+                        try {
+                            const previewText = buildPreview('template', {
+                                templateName: sc.template,
+                                templateBody: templateBodyText,
+                            });
+
+                            await Conversation.findOneAndUpdate(
+                                { tenantId: sc.tenantId, contactId: to },
+                                {
+                                    name: to,
+                                    lastMessage: previewText,
+                                    lastActive: new Date(),
+                                    $setOnInsert: { hasReply: false }
+                                },
+                                { upsert: true }
+                            );
+
+                            await Message.create({
+                                tenantId: sc.tenantId,
+                                contactId: to,
+                                text: templateBodyText || `📋 Template: ${sc.template}`,
+                                isMe: true,
+                                time: new Date().toISOString(),
+                                messageType: 'template',
+                                templateName: sc.template,
+                                templateBody: templateBodyText,
+                                wamid: wamid,
+                                status: 'sent',
+                            });
+
+                            await broadcastConversations(sc.tenantId);
+                            await broadcastMessages(sc.tenantId, to);
+                        } catch (msgErr) {
+                            console.error(`[ScheduledCampaign] Failed to create Message/Conversation log for ${to}:`, msgErr.message);
+                        }
                     } else {
                         failure++;
                         await Recipient.create({
