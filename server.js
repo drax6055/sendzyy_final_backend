@@ -2466,16 +2466,63 @@ app.get('/campaigns', authenticate, async (req, res) => {
         }).select('campaignId').lean();
         const pendingSet = new Set(pendingPhases.map(p => p.campaignId));
 
-        const enriched = campaigns.map(c => ({
-            ...c.toObject(),
-            hasPendingRetry: pendingSet.has(c.id),
-        }));
+        // Compute accurate per-status counts from the Recipient collection (ground truth).
+        // The campaign-document counters (failureCount, deliveredCount, etc.) can be stale
+        // because _completeCampaign marks recipients as failed without incrementing failureCount,
+        // and webhook-based increments may arrive out of order.
+        const recipientAgg = await Recipient.aggregate([
+            { $match: { tenantId: req.user.tenantId, campaignId: { $in: campaignIds } } },
+            {
+                $group: {
+                    _id: { campaignId: '$campaignId', status: '$status' },
+                    count: { $sum: 1 }
+                }
+            }
+        ]);
+
+        // Build a lookup map: campaignId -> { sent, delivered, read, failed, total }
+        const recipientCounts = {};
+        for (const row of recipientAgg) {
+            const cid = row._id.campaignId;
+            const status = row._id.status;
+            if (!recipientCounts[cid]) {
+                recipientCounts[cid] = { sent: 0, delivered: 0, read: 0, failed: 0, total: 0 };
+            }
+            recipientCounts[cid].total += row.count;
+            if (status === 'sent')      recipientCounts[cid].sent      += row.count;
+            if (status === 'delivered') recipientCounts[cid].delivered += row.count;
+            if (status === 'read')      recipientCounts[cid].read      += row.count;
+            if (status === 'failed')    recipientCounts[cid].failed    += row.count;
+        }
+
+        const enriched = campaigns.map(c => {
+            const rc = recipientCounts[c.id];
+            const base = c.toObject();
+
+            // If recipient docs exist, override campaign-level counters with live values.
+            // deliveredCount includes messages that were later "read" (delivery is implied).
+            if (rc && rc.total > 0) {
+                base.totalCount     = rc.total;
+                base.successCount   = rc.total - rc.failed;          // non-failed = sent/delivered/read
+                base.failureCount   = rc.failed;
+                base.deliveredCount = rc.delivered + rc.read;        // delivered still counts as delivered
+                base.readCount      = rc.read;
+            }
+            // else: campaign doc fields remain as-is (campaign still dispatching, no recipients yet)
+
+            return {
+                ...base,
+                hasPendingRetry: pendingSet.has(c.id),
+            };
+        });
 
         res.json({ campaigns: enriched });
     } catch (error) {
+        console.error('GET /campaigns error:', error);
         res.status(500).json({ error: 'Failed to fetch campaigns' });
     }
 });
+
 
 // ── Campaign Lifecycle Endpoints ──────────────────────────────────────────────
 
@@ -2891,8 +2938,55 @@ app.post('/scheduled-campaigns', authenticate, async (req, res) => {
 app.get('/scheduled-campaigns', authenticate, async (req, res) => {
     try {
         const list = await ScheduledCampaign.find({ tenantId: req.user.tenantId }).sort({ scheduledAt: -1 });
-        res.json(list.map(s => ({ ...s.toObject(), id: s._id.toString() })));
+        
+        // Compute accurate live counts from the Recipient collection (ground truth)
+        const campaignIds = list.map(s => s.resultCampaignId || `sched_${s._id}`);
+        const recipientAgg = await Recipient.aggregate([
+            { $match: { tenantId: req.user.tenantId, campaignId: { $in: campaignIds } } },
+            {
+                $group: {
+                    _id: { campaignId: '$campaignId', status: '$status' },
+                    count: { $sum: 1 }
+                }
+            }
+        ]);
+
+        const recipientCounts = {};
+        for (const row of recipientAgg) {
+            const cid = row._id.campaignId;
+            const status = row._id.status;
+            if (!recipientCounts[cid]) {
+                recipientCounts[cid] = { sent: 0, delivered: 0, read: 0, failed: 0, total: 0 };
+            }
+            recipientCounts[cid].total += row.count;
+            if (status === 'sent')      recipientCounts[cid].sent      += row.count;
+            if (status === 'delivered') recipientCounts[cid].delivered += row.count;
+            if (status === 'read')      recipientCounts[cid].read      += row.count;
+            if (status === 'failed')    recipientCounts[cid].failed    += row.count;
+        }
+
+        const enriched = list.map(s => {
+            const cid = s.resultCampaignId || `sched_${s._id}`;
+            const rc = recipientCounts[cid];
+            const base = s.toObject();
+            base.id = s._id.toString();
+            if (rc && rc.total > 0) {
+                base.successCount = rc.total - rc.failed;
+                base.failureCount = rc.failed;
+                base.deliveredCount = rc.delivered + rc.read;
+                base.readCount = rc.read;
+                base.totalCount = rc.total;
+            } else {
+                base.deliveredCount = 0;
+                base.readCount = 0;
+                base.totalCount = s.recipients ? s.recipients.length : 0;
+            }
+            return base;
+        });
+
+        res.json(enriched);
     } catch (err) {
+        console.error('Failed to fetch scheduled campaigns:', err.message);
         res.status(500).json({ error: 'Failed to fetch scheduled campaigns' });
     }
 });
@@ -5534,13 +5628,27 @@ app.post('/webhook', async (req, res) => {
                 await broadcastMessages(mapping.tenantId, mapping.to);
 
                 if (mapping.campaignId) {
-                    const inc = {};
-                    if (status === 'delivered') inc.deliveredCount = 1;
-                    if (status === 'read') { inc.readCount = 1; inc.deliveredCount = -1; }
-                    if (status === 'failed') inc.failureCount = 1;
+                    const filter = { tenantId: mapping.tenantId, id: mapping.campaignId };
 
-                    if (Object.keys(inc).length > 0) {
-                        await Campaign.findOneAndUpdate({ tenantId: mapping.tenantId, id: mapping.campaignId }, { $inc: inc });
+                    if (status === 'delivered') {
+                        await Campaign.findOneAndUpdate(filter, { $inc: { deliveredCount: 1 } });
+                    } else if (status === 'read') {
+                        // Meta sometimes sends 'read' without a prior 'delivered' webhook,
+                        // which would make deliveredCount go negative. Use an aggregation
+                        // pipeline update to clamp deliveredCount to 0 at minimum.
+                        await Campaign.findOneAndUpdate(filter, [
+                            {
+                                $set: {
+                                    readCount: { $add: ['$readCount', 1] },
+                                    deliveredCount: { $max: [0, { $subtract: ['$deliveredCount', 1] }] }
+                                }
+                            }
+                        ]);
+                    } else if (status === 'failed') {
+                        // Note: failureCount here = delivery failures (message failed AFTER being sent to Meta).
+                        // successCount is NOT decremented — it remains the API-acceptance count (how many
+                        // we submitted to Meta), matching the industry standard used by WATI and AiSensy.
+                        await Campaign.findOneAndUpdate(filter, { $inc: { failureCount: 1 } });
                     }
                 }
 
@@ -5929,6 +6037,46 @@ async function runScheduledCampaigns() {
                     }
                 }
             );
+
+            // ── Trigger retry system (mirrors normal campaign behaviour) ────────────
+            // Schedule phase 1 (grace-period evaluation) so the RetryScheduler cron
+            // can pick up failed/undelivered messages after the configured interval.
+            // Returns null (no-op) when the campaign has zero retry phases configured.
+            try {
+                const scheduledPhase = await retryScheduler.schedulePhase(
+                    campaignId,
+                    1,           // phase 1 = grace-period evaluation
+                    new Date()   // completion time = now
+                );
+                if (scheduledPhase) {
+                    console.log(JSON.stringify({
+                        service: 'ScheduledCampaign',
+                        event: 'retry_phase1_scheduled',
+                        campaignId,
+                        scheduledAt: scheduledPhase.scheduledAt.toISOString(),
+                        message: 'Phase 1 grace-period evaluation scheduled for retry system',
+                        timestamp: new Date().toISOString()
+                    }));
+                } else {
+                    console.log(JSON.stringify({
+                        service: 'ScheduledCampaign',
+                        event: 'retry_phase1_skipped',
+                        campaignId,
+                        message: 'No retry phases configured — skipping retry scheduling',
+                        timestamp: new Date().toISOString()
+                    }));
+                }
+            } catch (retryErr) {
+                // Non-fatal: log the error but do not prevent the scheduled job from completing
+                console.error(JSON.stringify({
+                    service: 'ScheduledCampaign',
+                    event: 'retry_phase1_schedule_error',
+                    campaignId,
+                    error: retryErr.message,
+                    message: 'Failed to schedule retry phase 1 — campaign will not be retried',
+                    timestamp: new Date().toISOString()
+                }));
+            }
 
             // Emit progress updates to active dashboard rooms
             await broadcastCampaigns(sc.tenantId);
