@@ -131,6 +131,7 @@ const messageSchema = new mongoose.Schema({
     wamid: { type: String },                 // WhatsApp message ID from Meta
     status: { type: String, default: 'sent' }, // 'sent' | 'delivered' | 'read' | 'failed'
     errorDetails: { type: String },         // Why message failed
+    source: { type: String, default: null }, // 'chatbot' | 'chatbot_reply' | 'chatbot_trigger' | null (null = live chat)
 });
 const Message = mongoose.model('Message', messageSchema);
 
@@ -623,7 +624,13 @@ const httpServer = http.createServer(app);
 const io = new Server(httpServer, { cors: { origin: '*' } });
 SocketEmitter.setIo(io);
 app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.raw({ type: 'application/octet-stream', limit: '50mb' }));
+app.use(bodyParser.raw({
+    type: (req) => {
+        const contentType = req.headers['content-type'] || '';
+        return contentType.toLowerCase().includes('application/octet-stream');
+    },
+    limit: '50mb'
+}));
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'whatsapp_bulk_verify_token_123';
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v25.0';
@@ -2391,6 +2398,17 @@ app.post('/send-message', authenticate, async (req, res) => {
                     const tplComponents = await fetchTemplateComponents(tenant, template.name);
                     const bodyComponent = (tplComponents || []).find(c => c.type === 'BODY');
                     outboundTemplateBody = bodyComponent?.text || null;
+                    if (outboundTemplateBody && template.components) {
+                        const bodyPart = template.components.find(c => c.type.toLowerCase() === 'body');
+                        if (bodyPart && Array.isArray(bodyPart.parameters)) {
+                            bodyPart.parameters.forEach((param, idx) => {
+                                outboundTemplateBody = outboundTemplateBody.replace(
+                                    new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g'),
+                                    param.text || ''
+                                );
+                            });
+                        }
+                    }
                 } catch (_) {
                     outboundTemplateBody = null;
                 }
@@ -2448,16 +2466,63 @@ app.get('/campaigns', authenticate, async (req, res) => {
         }).select('campaignId').lean();
         const pendingSet = new Set(pendingPhases.map(p => p.campaignId));
 
-        const enriched = campaigns.map(c => ({
-            ...c.toObject(),
-            hasPendingRetry: pendingSet.has(c.id),
-        }));
+        // Compute accurate per-status counts from the Recipient collection (ground truth).
+        // The campaign-document counters (failureCount, deliveredCount, etc.) can be stale
+        // because _completeCampaign marks recipients as failed without incrementing failureCount,
+        // and webhook-based increments may arrive out of order.
+        const recipientAgg = await Recipient.aggregate([
+            { $match: { tenantId: req.user.tenantId, campaignId: { $in: campaignIds } } },
+            {
+                $group: {
+                    _id: { campaignId: '$campaignId', status: '$status' },
+                    count: { $sum: 1 }
+                }
+            }
+        ]);
+
+        // Build a lookup map: campaignId -> { sent, delivered, read, failed, total }
+        const recipientCounts = {};
+        for (const row of recipientAgg) {
+            const cid = row._id.campaignId;
+            const status = row._id.status;
+            if (!recipientCounts[cid]) {
+                recipientCounts[cid] = { sent: 0, delivered: 0, read: 0, failed: 0, total: 0 };
+            }
+            recipientCounts[cid].total += row.count;
+            if (status === 'sent')      recipientCounts[cid].sent      += row.count;
+            if (status === 'delivered') recipientCounts[cid].delivered += row.count;
+            if (status === 'read')      recipientCounts[cid].read      += row.count;
+            if (status === 'failed')    recipientCounts[cid].failed    += row.count;
+        }
+
+        const enriched = campaigns.map(c => {
+            const rc = recipientCounts[c.id];
+            const base = c.toObject();
+
+            // If recipient docs exist, override campaign-level counters with live values.
+            // deliveredCount includes messages that were later "read" (delivery is implied).
+            if (rc && rc.total > 0) {
+                base.totalCount     = rc.total;
+                base.successCount   = rc.total - rc.failed;          // non-failed = sent/delivered/read
+                base.failureCount   = rc.failed;
+                base.deliveredCount = rc.delivered + rc.read;        // delivered still counts as delivered
+                base.readCount      = rc.read;
+            }
+            // else: campaign doc fields remain as-is (campaign still dispatching, no recipients yet)
+
+            return {
+                ...base,
+                hasPendingRetry: pendingSet.has(c.id),
+            };
+        });
 
         res.json({ campaigns: enriched });
     } catch (error) {
+        console.error('GET /campaigns error:', error);
         res.status(500).json({ error: 'Failed to fetch campaigns' });
     }
 });
+
 
 // ── Campaign Lifecycle Endpoints ──────────────────────────────────────────────
 
@@ -2873,8 +2938,55 @@ app.post('/scheduled-campaigns', authenticate, async (req, res) => {
 app.get('/scheduled-campaigns', authenticate, async (req, res) => {
     try {
         const list = await ScheduledCampaign.find({ tenantId: req.user.tenantId }).sort({ scheduledAt: -1 });
-        res.json(list.map(s => ({ ...s.toObject(), id: s._id.toString() })));
+        
+        // Compute accurate live counts from the Recipient collection (ground truth)
+        const campaignIds = list.map(s => s.resultCampaignId || `sched_${s._id}`);
+        const recipientAgg = await Recipient.aggregate([
+            { $match: { tenantId: req.user.tenantId, campaignId: { $in: campaignIds } } },
+            {
+                $group: {
+                    _id: { campaignId: '$campaignId', status: '$status' },
+                    count: { $sum: 1 }
+                }
+            }
+        ]);
+
+        const recipientCounts = {};
+        for (const row of recipientAgg) {
+            const cid = row._id.campaignId;
+            const status = row._id.status;
+            if (!recipientCounts[cid]) {
+                recipientCounts[cid] = { sent: 0, delivered: 0, read: 0, failed: 0, total: 0 };
+            }
+            recipientCounts[cid].total += row.count;
+            if (status === 'sent')      recipientCounts[cid].sent      += row.count;
+            if (status === 'delivered') recipientCounts[cid].delivered += row.count;
+            if (status === 'read')      recipientCounts[cid].read      += row.count;
+            if (status === 'failed')    recipientCounts[cid].failed    += row.count;
+        }
+
+        const enriched = list.map(s => {
+            const cid = s.resultCampaignId || `sched_${s._id}`;
+            const rc = recipientCounts[cid];
+            const base = s.toObject();
+            base.id = s._id.toString();
+            if (rc && rc.total > 0) {
+                base.successCount = rc.total - rc.failed;
+                base.failureCount = rc.failed;
+                base.deliveredCount = rc.delivered + rc.read;
+                base.readCount = rc.read;
+                base.totalCount = rc.total;
+            } else {
+                base.deliveredCount = 0;
+                base.readCount = 0;
+                base.totalCount = s.recipients ? s.recipients.length : 0;
+            }
+            return base;
+        });
+
+        res.json(enriched);
     } catch (err) {
+        console.error('Failed to fetch scheduled campaigns:', err.message);
         res.status(500).json({ error: 'Failed to fetch scheduled campaigns' });
     }
 });
@@ -2896,7 +3008,8 @@ app.delete('/scheduled-campaigns/:id', authenticate, async (req, res) => {
 //  Conversations & Messages REST
 app.get('/conversations', authenticate, async (req, res) => {
     try {
-        const convs = await Conversation.find({ tenantId: req.user.tenantId, hasReply: true })
+        // Include all conversations (both live-chat and chatbot-initiated) — no hasReply filter
+        const convs = await Conversation.find({ tenantId: req.user.tenantId })
             .sort({ lastActive: -1 }).lean();
         res.json(convs.map(c => ({
             id: c.contactId,
@@ -2928,6 +3041,7 @@ app.get('/conversations/:contactId/messages', authenticate, async (req, res) => 
             wamid: m.wamid || null,
             status: m.status || 'sent',
             errorDetails: m.errorDetails || null,
+            source: m.source || null,
         })));
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch messages' });
@@ -3985,17 +4099,19 @@ app.post('/upload-media', authenticate, async (req, res) => {
     const { name, size, type, accessToken, appId } = req.query;
     const fileData = req.body;
     try {
+        if (!fileData || !Buffer.isBuffer(fileData)) {
+            console.error('[Upload Media Error]: req.body is not a buffer. Content-Type:', req.headers['content-type']);
+            return res.status(400).json({ error: { message: 'Invalid file data. Expected binary stream.' } });
+        }
         let processedFileData = fileData;
-        if (Buffer.isBuffer(fileData)) {
-            const str = fileData.toString('utf8').trim();
-            if (str.startsWith('[') && str.endsWith(']')) {
-                try {
-                    const parsed = JSON.parse(str);
-                    if (Array.isArray(parsed)) {
-                        processedFileData = Buffer.from(parsed);
-                    }
-                } catch (_) {}
-            }
+        const str = fileData.toString('utf8').trim();
+        if (str.startsWith('[') && str.endsWith(']')) {
+            try {
+                const parsed = JSON.parse(str);
+                if (Array.isArray(parsed)) {
+                    processedFileData = Buffer.from(parsed);
+                }
+            } catch (_) {}
         }
 
         const initResponse = await axios.post(`${WHATSAPP_API_URL}/${appId}/uploads`, null, {
@@ -4016,17 +4132,19 @@ app.post('/media-upload', authenticate, async (req, res) => {
     const { phoneNumberId, accessToken, fileName, fileType } = req.query;
     const fileData = req.body;
     try {
+        if (!fileData || !Buffer.isBuffer(fileData)) {
+            console.error('[Media Upload Error]: req.body is not a buffer. Content-Type:', req.headers['content-type']);
+            return res.status(400).json({ error: { message: 'Invalid file data. Expected binary stream.' } });
+        }
         let processedFileData = fileData;
-        if (Buffer.isBuffer(fileData)) {
-            const str = fileData.toString('utf8').trim();
-            if (str.startsWith('[') && str.endsWith(']')) {
-                try {
-                    const parsed = JSON.parse(str);
-                    if (Array.isArray(parsed)) {
-                        processedFileData = Buffer.from(parsed);
-                    }
-                } catch (_) {}
-            }
+        const str = fileData.toString('utf8').trim();
+        if (str.startsWith('[') && str.endsWith(']')) {
+            try {
+                const parsed = JSON.parse(str);
+                if (Array.isArray(parsed)) {
+                    processedFileData = Buffer.from(parsed);
+                }
+            } catch (_) {}
         }
 
         const FormData = require('form-data');
@@ -4166,9 +4284,13 @@ async function handleMetaAuth401(tenantId) {
 // Helper — send a plain text message via Meta API (returns true on success)
 // chatbotId is optional; pass session.chatbotId when available for accurate analytics
 async function sendChatbotText(tenant, to, text, chatbotId) {
+    const tenantId = tenant._id.toString();
     const { phoneNumberId, accessToken } = tenant.whatsappConfig;
+    let wamid = null;
+
+    // ── Step 1: Send via WhatsApp API ────────────────────────────────────────
     try {
-        await axios.post(
+        const response = await axios.post(
             `${WHATSAPP_API_URL}/${phoneNumberId}/messages`,
             {
                 messaging_product: 'whatsapp',
@@ -4178,21 +4300,135 @@ async function sendChatbotText(tenant, to, text, chatbotId) {
             },
             { headers: { Authorization: `Bearer ${accessToken}` } }
         );
-        // Increment messagesSent analytics (best-effort)
-        if (chatbotId) {
-            const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
-            ChatbotAnalytics.findOneAndUpdate(
-                { tenantId: tenant._id.toString(), chatbotId, date: todayDate },
-                { $inc: { messagesSent: 1 } },
-                { upsert: true }
-            ).catch(() => { });
-        }
-        return true;
+        wamid = response.data?.messages?.[0]?.id || null;
     } catch (err) {
-        if (err.response?.status === 401) await handleMetaAuth401(tenant._id.toString());
-        console.error(` [ChatbotEngine] sendChatbotText error:`, err.response?.data || err.message);
-        return false;
+        if (err.response?.status === 401) await handleMetaAuth401(tenantId);
+        console.error(` [ChatbotEngine] sendChatbotText API error:`, err.response?.data || err.message);
+        const errorDetails = err.response?.data?.error?.message || err.message;
+        saveChatbotMessageToDB({
+            tenantId,
+            contactId: to,
+            text: `⚠️ Chatbot failed to send message: ${errorDetails}`,
+            isMe: true,
+            messageType: 'text',
+            source: 'chatbot',
+            previewText: '⚠️ Failed to send message',
+        }).catch(() => {});
+        return false; // WhatsApp send failed — do not advance the flow
     }
+
+    // ── Step 2: Analytics (best-effort, non-blocking) ────────────────────────
+    if (chatbotId) {
+        const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
+        ChatbotAnalytics.findOneAndUpdate(
+            { tenantId, chatbotId, date: todayDate },
+            { $inc: { messagesSent: 1 } },
+            { upsert: true }
+        ).catch(() => { });
+    }
+
+    // ── Step 3: Persist to DB (best-effort, non-blocking to chatbot flow) ────
+    saveChatbotMessageToDB({
+        tenantId,
+        contactId: to,
+        text,
+        isMe: true,
+        messageType: 'text',
+        source: 'chatbot',
+        wamid,
+        previewText: text,
+    }).catch(e => console.error('[ChatbotEngine] saveChatbotMessageToDB (text) error:', e.message));
+
+    return true;
+}
+
+/**
+ * saveChatbotMessageToDB — persists a chatbot message (bot-sent or customer reply)
+ * to the Message collection, updates the Conversation preview, and broadcasts via socket.
+ *
+ * This function is intentionally fire-and-forget from callers (they .catch() on it).
+ * Any failure here must NOT affect the chatbot flow logic.
+ *
+ * @param {Object} opts
+ * @param {string}  opts.tenantId
+ * @param {string}  opts.contactId
+ * @param {string}  [opts.text]
+ * @param {boolean} opts.isMe
+ * @param {string}  opts.messageType   - 'text' | 'interactive' | 'template'
+ * @param {string}  opts.source        - 'chatbot' | 'chatbot_reply' | 'chatbot_trigger'
+ * @param {Object}  [opts.interactivePayload]
+ * @param {string}  [opts.templateName]
+ * @param {string}  [opts.wamid]
+ * @param {string}  opts.previewText   - text shown in conversation sidebar preview
+ * @param {string}  [opts.name]        - contact name (for Conversation upsert)
+ * @returns {Promise<void>}
+ */
+async function saveChatbotMessageToDB({
+    tenantId,
+    contactId,
+    text = '',
+    isMe,
+    messageType,
+    source,
+    interactivePayload = null,
+    templateName = null,
+    templateBody = null,
+    wamid = null,
+    previewText,
+    name = null,
+}) {
+    const now = new Date();
+
+    // Truncate preview
+    const preview = (previewText || text || '').substring(0, 100);
+
+    // 1. Save message
+    await Message.create({
+        tenantId,
+        contactId,
+        text: text || '',
+        isMe,
+        time: now.toISOString(),
+        timestamp: now,
+        messageType,
+        source,
+        interactivePayload,
+        templateName,
+        templateBody,
+        wamid,
+        status: isMe ? 'sent' : undefined,
+    });
+
+    // Create/update StatusMapping for delivery tracking
+    if (wamid && isMe) {
+        try {
+            await StatusMapping.findOneAndUpdate(
+                { wamid },
+                { wamid, tenantId, to: contactId },
+                { upsert: true }
+            );
+        } catch (err) {
+            console.error('[ChatbotEngine] StatusMapping creation failed:', err.message);
+        }
+    }
+
+    // 2. Update conversation preview
+    const convUpdate = {
+        lastMessage: preview,
+        lastActive: now,
+        hasReply: true, // Always mark visible — both bot-sent and customer replies
+    };
+    if (name) convUpdate.name = name;
+
+    await Conversation.findOneAndUpdate(
+        { tenantId, contactId },
+        convUpdate,
+        { upsert: true }
+    );
+
+    // 3. Broadcast to socket (non-blocking)
+    broadcastMessages(tenantId, contactId).catch(() => {});
+    broadcastConversations(tenantId).catch(() => {});
 }
 
 // Helper — re-send the prompt for the current node (used by media guard and condition fallback)
@@ -4200,6 +4436,7 @@ async function resendNodePrompt(session, node, tenant, from) {
     if (!node) return;
     const type = node.type;
     const data = node.data || {};
+    const tenantId = tenant._id.toString();
     const { phoneNumberId, accessToken } = tenant.whatsappConfig;
 
     if (type === 'question') {
@@ -4210,8 +4447,12 @@ async function resendNodePrompt(session, node, tenant, from) {
             reply: { id: `btn_${i}`, title: (b.label || b.title || '').substring(0, 20) },
         }));
         if (buttons.length === 0) return;
+        const promptText = data.text || data.body || 'Choose an option:';
+        let wamid = null;
+
+        // ── Send via WhatsApp API ────────────────────────────────────────────
         try {
-            await axios.post(
+            const resp = await axios.post(
                 `${WHATSAPP_API_URL}/${phoneNumberId}/messages`,
                 {
                     messaging_product: 'whatsapp',
@@ -4219,16 +4460,36 @@ async function resendNodePrompt(session, node, tenant, from) {
                     type: 'interactive',
                     interactive: {
                         type: 'button',
-                        body: { text: data.text || data.body || 'Choose an option:' },
+                        body: { text: promptText },
                         action: { buttons },
                     },
                 },
                 { headers: { Authorization: `Bearer ${accessToken}` } }
             );
+            wamid = resp.data?.messages?.[0]?.id || null;
         } catch (err) {
-            if (err.response?.status === 401) await handleMetaAuth401(tenant._id.toString());
+            if (err.response?.status === 401) await handleMetaAuth401(tenantId);
             console.error(` [ChatbotEngine] resendNodePrompt quickReply error:`, err.response?.data || err.message);
+            return;
         }
+
+        // ── Persist re-prompt to DB ──────────────────────────────────────────
+        saveChatbotMessageToDB({
+            tenantId,
+            contactId: from,
+            text: promptText,
+            isMe: true,
+            messageType: 'interactive',
+            source: 'chatbot',
+            wamid,
+            interactivePayload: {
+                type: 'button',
+                title: promptText,
+                buttons: (data.buttons || []).map(b => ({ label: b.label || b.title || '' })),
+            },
+            previewText: '🤖 ' + promptText,
+        }).catch(e => console.error('[ChatbotEngine] resendNodePrompt quickReply DB error:', e.message));
+
     } else if (type === 'listMessage') {
         const rows = (data.items || data.rows || []).slice(0, 10).map((item, i) => ({
             id: `row_${i}`,
@@ -4236,8 +4497,12 @@ async function resendNodePrompt(session, node, tenant, from) {
             description: (item.description || '').substring(0, 72),
         }));
         if (rows.length === 0) return;
+        const promptText = data.text || data.body || 'Choose an option:';
+        let wamid = null;
+
+        // ── Send via WhatsApp API ────────────────────────────────────────────
         try {
-            await axios.post(
+            const resp = await axios.post(
                 `${WHATSAPP_API_URL}/${phoneNumberId}/messages`,
                 {
                     messaging_product: 'whatsapp',
@@ -4245,7 +4510,7 @@ async function resendNodePrompt(session, node, tenant, from) {
                     type: 'interactive',
                     interactive: {
                         type: 'list',
-                        body: { text: data.text || data.body || 'Choose an option:' },
+                        body: { text: promptText },
                         action: {
                             button: data.buttonLabel || 'View Options',
                             sections: [{ title: data.sectionTitle || 'Options', rows }],
@@ -4254,10 +4519,34 @@ async function resendNodePrompt(session, node, tenant, from) {
                 },
                 { headers: { Authorization: `Bearer ${accessToken}` } }
             );
+            wamid = resp.data?.messages?.[0]?.id || null;
         } catch (err) {
-            if (err.response?.status === 401) await handleMetaAuth401(tenant._id.toString());
+            if (err.response?.status === 401) await handleMetaAuth401(tenantId);
             console.error(` [ChatbotEngine] resendNodePrompt listMessage error:`, err.response?.data || err.message);
+            return;
         }
+
+        // ── Persist re-prompt to DB ──────────────────────────────────────────
+        saveChatbotMessageToDB({
+            tenantId,
+            contactId: from,
+            text: promptText,
+            isMe: true,
+            messageType: 'interactive',
+            source: 'chatbot',
+            wamid,
+            interactivePayload: {
+                type: 'list',
+                title: promptText,
+                buttonLabel: data.buttonLabel || 'View Options',
+                items: (data.items || data.rows || []).map(item => ({
+                    title: item.title || '',
+                    description: item.description || '',
+                })),
+            },
+            previewText: '🤖 ' + promptText,
+        }).catch(e => console.error('[ChatbotEngine] resendNodePrompt listMessage DB error:', e.message));
+
     } else if (type === 'condition') {
         if (data.prompt) await sendChatbotText(tenant, from, data.prompt, session.chatbotId);
     }
@@ -4440,7 +4729,8 @@ async function handleQuickReplyNode(session, node, tenant, from) {
         return;
     }
     try {
-        await axios.post(
+        // ── Step 1: Send via WhatsApp API ────────────────────────────────────
+        const _qrResp = await axios.post(
             `${WHATSAPP_API_URL}/${phoneNumberId}/messages`,
             {
                 messaging_product: 'whatsapp',
@@ -4454,14 +4744,46 @@ async function handleQuickReplyNode(session, node, tenant, from) {
             },
             { headers: { Authorization: `Bearer ${accessToken}` } }
         );
+        const _qrWamid = _qrResp.data?.messages?.[0]?.id || null;
+
+        // ── Step 2: Session state ────────────────────────────────────────────
+        session.currentNodeId = node.id;
+        session.waitingForReply = true;
+        await session.save();
+
+        // ── Step 3: Persist to DB (best-effort, independent from flow) ───────
+        const _qrText = data.text || data.body || 'Choose an option:';
+        saveChatbotMessageToDB({
+            tenantId: tenant._id.toString(),
+            contactId: from,
+            text: _qrText,
+            isMe: true,
+            messageType: 'interactive',
+            source: 'chatbot',
+            wamid: _qrWamid,
+            interactivePayload: {
+                type: 'button',
+                title: _qrText,
+                buttons: (data.buttons || []).map(b => ({ label: b.label || b.title || '' })),
+            },
+            previewText: '🤖 ' + _qrText,
+        }).catch(e => console.error('[ChatbotEngine] handleQuickReplyNode DB error:', e.message));
+
     } catch (err) {
         if (err.response?.status === 401) await handleMetaAuth401(tenant._id.toString());
         console.error(` [ChatbotEngine] quickReply send error:`, err.response?.data || err.message);
-        return;
+        const errorDetails = getMetaErrorDetails(err);
+        saveChatbotMessageToDB({
+            tenantId: tenant._id.toString(),
+            contactId: from,
+            text: `⚠️ Chatbot failed to send interactive buttons: ${errorDetails}`,
+            isMe: true,
+            messageType: 'text',
+            source: 'chatbot',
+            previewText: '⚠️ Failed to send buttons',
+        }).catch(() => {});
+        return; // WhatsApp API failed — do not set session state
     }
-    session.currentNodeId = node.id;
-    session.waitingForReply = true;
-    await session.save();
 }
 
 // Task 2.8 — List Message Node: send interactive list message, pause OR process reply
@@ -4514,7 +4836,8 @@ async function handleListMessageNode(session, node, tenant, from) {
         return;
     }
     try {
-        await axios.post(
+        // ── Step 1: Send via WhatsApp API ────────────────────────────────────
+        const _lmResp = await axios.post(
             `${WHATSAPP_API_URL}/${phoneNumberId}/messages`,
             {
                 messaging_product: 'whatsapp',
@@ -4531,14 +4854,50 @@ async function handleListMessageNode(session, node, tenant, from) {
             },
             { headers: { Authorization: `Bearer ${accessToken}` } }
         );
+        const _lmWamid = _lmResp.data?.messages?.[0]?.id || null;
+
+        // ── Step 2: Session state ────────────────────────────────────────────
+        session.currentNodeId = node.id;
+        session.waitingForReply = true;
+        await session.save();
+
+        // ── Step 3: Persist to DB (best-effort, independent from flow) ───────
+        const _lmText = data.text || data.body || 'Choose an option:';
+        saveChatbotMessageToDB({
+            tenantId: tenant._id.toString(),
+            contactId: from,
+            text: _lmText,
+            isMe: true,
+            messageType: 'interactive',
+            source: 'chatbot',
+            wamid: _lmWamid,
+            interactivePayload: {
+                type: 'list',
+                title: _lmText,
+                buttonLabel: data.buttonLabel || 'View Options',
+                items: (data.items || data.rows || []).map(item => ({
+                    title: item.title || '',
+                    description: item.description || '',
+                })),
+            },
+            previewText: '🤖 ' + _lmText,
+        }).catch(e => console.error('[ChatbotEngine] handleListMessageNode DB error:', e.message));
+
     } catch (err) {
         if (err.response?.status === 401) await handleMetaAuth401(tenant._id.toString());
         console.error(` [ChatbotEngine] listMessage send error:`, JSON.stringify(err.response?.data || err.message));
-        return;
+        const errorDetails = getMetaErrorDetails(err);
+        saveChatbotMessageToDB({
+            tenantId: tenant._id.toString(),
+            contactId: from,
+            text: `⚠️ Chatbot failed to send list menu: ${errorDetails}`,
+            isMe: true,
+            messageType: 'text',
+            source: 'chatbot',
+            previewText: '⚠️ Failed to send list menu',
+        }).catch(() => {});
+        return; // WhatsApp API failed — do not set session state
     }
-    session.currentNodeId = node.id;
-    session.waitingForReply = true;
-    await session.save();
 }
 
 // Task 2.9 — Condition Node: case-insensitive keyword match, fallback or re-prompt
@@ -4631,7 +4990,7 @@ async function handleActionNode(session, node, tenant, from) {
             }
 
             try {
-                await axios.post(
+                const _tmResp = await axios.post(
                     `${WHATSAPP_API_URL}/${phoneNumberId}/messages`,
                     {
                         messaging_product: 'whatsapp',
@@ -4645,10 +5004,51 @@ async function handleActionNode(session, node, tenant, from) {
                     },
                     { headers: { Authorization: `Bearer ${accessToken}` } }
                 );
+                const _tmWamid = _tmResp.data?.messages?.[0]?.id || null;
+
+                let resolvedBody = null;
+                try {
+                    const tplComponents = await fetchTemplateComponents(tenant, templateName);
+                    const bodyComponent = (tplComponents || []).find(c => c.type === 'BODY');
+                    const templateBodyText = bodyComponent?.text || null;
+                    resolvedBody = templateBodyText;
+                    if (resolvedBody && Array.isArray(variables)) {
+                        variables.forEach((val, idx) => {
+                            resolvedBody = resolvedBody.replace(new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g'), String(val));
+                        });
+                    }
+                } catch (e) {
+                    console.error('[ChatbotEngine] fetchTemplateComponents error in handleActionNode:', e.message);
+                }
+
+                // Persist the bot template message to DB so tenant can see it
+                saveChatbotMessageToDB({
+                    tenantId,
+                    contactId: from,
+                    text: resolvedBody || `📋 Template: ${templateName}`,
+                    isMe: true,
+                    messageType: 'template',
+                    source: 'chatbot',
+                    templateName,
+                    templateBody: resolvedBody,
+                    wamid: _tmWamid,
+                    previewText: resolvedBody ? `🤖 ${resolvedBody}` : `🤖 Template: ${templateName}`,
+                }).catch(e => console.error('[ChatbotEngine] handleActionNode send_template DB error:', e.message));
+
             } catch (err) {
                 if (err.response?.status === 401) await handleMetaAuth401(tenantId);
                 console.error(` [ChatbotEngine] send_template error:`, err.response?.data || err.message);
-                return;
+                const errorDetails = getMetaErrorDetails(err);
+                saveChatbotMessageToDB({
+                    tenantId,
+                    contactId: from,
+                    text: `⚠️ Chatbot failed to send template "${templateName}": ${errorDetails}`,
+                    isMe: true,
+                    messageType: 'text',
+                    source: 'chatbot',
+                    previewText: `⚠️ Failed to send template: ${templateName}`,
+                }).catch(() => {});
+                // Do not return — allow flow to advance so session doesn't get stuck
             }
         }
     } else if (subType === 'end_session') {
@@ -4720,6 +5120,18 @@ async function chatbotEngineProcessMessage(tenantId, message, profileName, from,
         if (session) {
             // Media guard: block non-text, non-interactive, non-button messages (images, audio, etc.)
             if (msgType !== 'text' && msgType !== 'interactive' && msgType !== 'button') {
+                // Log the unsupported media message so tenant can see customer sent something
+                saveChatbotMessageToDB({
+                    tenantId,
+                    contactId: from,
+                    text: '',
+                    isMe: false,
+                    messageType: msgType || 'unsupported',
+                    source: 'chatbot_reply',
+                    previewText: `[${msgType || 'media'} — not supported in chatbot]`,
+                    name: profileName,
+                }).catch(() => {}); // Best-effort; never block the guard response
+
                 await sendChatbotText(tenant, from, 'Please reply with text.', session.chatbotId);
                 // Re-send current node prompt
                 const flow = await getChatbotFlow(session.chatbotId);
@@ -4736,6 +5148,42 @@ async function chatbotEngineProcessMessage(tenantId, message, profileName, from,
             session._originalMessage = message;
             session._profileName = profileName;
             await session.save();
+
+            // Persist the customer's reply so tenant can see it in the Chat Screen (best-effort)
+            let _crInteractivePayload = null;
+            let _crMsgType = msgType;
+            let _crText = msgText;
+            if (msgType === 'interactive') {
+                const _crInteractive = message.interactive || {};
+                if (_crInteractive.type === 'list_reply') {
+                    _crInteractivePayload = {
+                        type: 'list_reply',
+                        title: _crInteractive.list_reply?.title || '',
+                        id: _crInteractive.list_reply?.id || '',
+                    };
+                    _crText = _crInteractive.list_reply?.title || '';
+                } else if (_crInteractive.type === 'button_reply') {
+                    _crInteractivePayload = {
+                        type: 'button_reply',
+                        title: _crInteractive.button_reply?.title || '',
+                        id: _crInteractive.button_reply?.id || '',
+                    };
+                    _crText = _crInteractive.button_reply?.title || '';
+                }
+            } else if (msgType === 'button') {
+                _crText = message.button?.text || message.button?.payload || '';
+            }
+            saveChatbotMessageToDB({
+                tenantId,
+                contactId: from,
+                text: _crText,
+                isMe: false,
+                messageType: _crMsgType,
+                source: 'chatbot_reply',
+                interactivePayload: _crInteractivePayload,
+                previewText: _crText || '\u21a9 Reply',
+                name: profileName,
+            }).catch(e => console.error('[ChatbotEngine] chatbot_reply DB save error:', e.message));
 
             const flow = await getChatbotFlow(session.chatbotId);
             if (!flow) {
@@ -4818,6 +5266,21 @@ async function chatbotEngineProcessMessage(tenantId, message, profileName, from,
             if (!session) return handleLiveChat(tenantId, message, profileName, from);
         }
 
+        // Persist the customer's trigger message so tenant can see it in the Chat Screen (best-effort)
+        const _trigText = msgType === 'button'
+            ? (message.button?.text || message.button?.payload || msgText)
+            : msgText;
+        saveChatbotMessageToDB({
+            tenantId,
+            contactId: from,
+            text: _trigText,
+            isMe: false,
+            messageType: msgType === 'button' ? 'button' : 'text',
+            source: 'chatbot_trigger',
+            previewText: _trigText || 'Started chatbot',
+            name: profileName,
+        }).catch(e => console.error('[ChatbotEngine] chatbot_trigger DB save error:', e.message));
+
         session._flow = flow;
         session._originalMessage = message;
         session._profileName = profileName;
@@ -4834,27 +5297,60 @@ async function getChatbotFlow(chatbotId) {
     } catch { return null; }
 }
 
-// Task 2.13 — session auto-expiry (runs every hour)
+// Task 2.13 — session auto-expiry (runs every minute)
 setInterval(async () => {
     try {
-        const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const timeoutMinutes = parseInt(process.env.CHATBOT_SESSION_TIMEOUT_MINUTES || '5', 10);
+        const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000);
         const expiredSessions = await ChatbotSession.find({ updatedAt: { $lt: cutoff } });
+
         for (const session of expiredSessions) {
             const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
+            
+            // 1. Increment droppedSessions analytics
             await ChatbotAnalytics.findOneAndUpdate(
                 { tenantId: session.tenantId, chatbotId: session.chatbotId, date: todayDate },
                 { $inc: { droppedSessions: 1 } },
                 { upsert: true }
             );
+
+            // 2. Log "Chatbot session ended due to inactivity" in the Chat Screen
+            saveChatbotMessageToDB({
+                tenantId: session.tenantId,
+                contactId: session.contactId,
+                text: '🤖 Chatbot session ended due to inactivity.',
+                isMe: true,
+                messageType: 'text',
+                source: 'chatbot',
+                previewText: 'Chatbot session ended due to inactivity.',
+            }).catch(() => {});
+
+            // 3. Delete session
             await ChatbotSession.deleteOne({ _id: session._id });
         }
+
         if (expiredSessions.length > 0) {
             console.log(` [ChatbotEngine] Expired ${expiredSessions.length} stale chatbot session(s)`);
         }
     } catch (err) {
         console.error(` [ChatbotEngine] Session expiry error:`, err.message);
     }
-}, 60 * 60 * 1000);
+}, 60 * 1000);
+
+function getMetaErrorDetails(err) {
+    if (!err) return 'Unknown error';
+    if (err.response?.data) {
+        const data = err.response.data;
+        if (Array.isArray(data.errors) && data.errors.length > 0) {
+            const firstErr = data.errors[0];
+            return firstErr.error_data?.details || firstErr.message || firstErr.title || err.message;
+        }
+        if (data.error) {
+            return data.error.error_data?.details || data.error.message || err.message;
+        }
+    }
+    return err.message || 'Unknown error';
+}
 
 // ─── End Chatbot Engine ───────────────────────────────────────────────────────
 
@@ -4917,7 +5413,7 @@ function buildPreview(messageType, opts = {}) {
         case 'reaction':
             return opts.emoji ? `${opts.emoji} Reaction` : '👍 Reaction';
         case 'contacts':
-            return '👤 Contact';
+            return `👤 Contact: ${opts.text ? opts.text.split('|')[0] : ''}`;
         default:
             return '⚠️ Unsupported message type';
     }
@@ -4966,7 +5462,14 @@ async function handleLiveChat(tenantId, message, profileName, from) {
     } else if (msgType === 'reaction') {
         msgText = message.reaction?.emoji || '';
     } else if (msgType === 'contacts') {
-        msgText = '';
+        if (message.contacts && message.contacts.length > 0) {
+            const contact = message.contacts[0];
+            const name = contact.name?.formatted_name || contact.name?.first_name || 'Contact';
+            const phone = contact.phones?.[0]?.phone || contact.phones?.[0]?.wa_id || '';
+            msgText = `${name}|${phone}`;
+        } else {
+            msgText = 'Contact';
+        }
     } else {
         msgText = '⚠️ Unsupported message type';
     }
@@ -5125,13 +5628,27 @@ app.post('/webhook', async (req, res) => {
                 await broadcastMessages(mapping.tenantId, mapping.to);
 
                 if (mapping.campaignId) {
-                    const inc = {};
-                    if (status === 'delivered') inc.deliveredCount = 1;
-                    if (status === 'read') { inc.readCount = 1; inc.deliveredCount = -1; }
-                    if (status === 'failed') inc.failureCount = 1;
+                    const filter = { tenantId: mapping.tenantId, id: mapping.campaignId };
 
-                    if (Object.keys(inc).length > 0) {
-                        await Campaign.findOneAndUpdate({ tenantId: mapping.tenantId, id: mapping.campaignId }, { $inc: inc });
+                    if (status === 'delivered') {
+                        await Campaign.findOneAndUpdate(filter, { $inc: { deliveredCount: 1 } });
+                    } else if (status === 'read') {
+                        // Meta sometimes sends 'read' without a prior 'delivered' webhook,
+                        // which would make deliveredCount go negative. Use an aggregation
+                        // pipeline update to clamp deliveredCount to 0 at minimum.
+                        await Campaign.findOneAndUpdate(filter, [
+                            {
+                                $set: {
+                                    readCount: { $add: ['$readCount', 1] },
+                                    deliveredCount: { $max: [0, { $subtract: ['$deliveredCount', 1] }] }
+                                }
+                            }
+                        ]);
+                    } else if (status === 'failed') {
+                        // Note: failureCount here = delivery failures (message failed AFTER being sent to Meta).
+                        // successCount is NOT decremented — it remains the API-acceptance count (how many
+                        // we submitted to Meta), matching the industry standard used by WATI and AiSensy.
+                        await Campaign.findOneAndUpdate(filter, { $inc: { failureCount: 1 } });
                     }
                 }
 
@@ -5325,6 +5842,7 @@ async function broadcastMessages(tenantId, contactId) {
                 wamid: m.wamid || null,
                 status: m.status || 'sent',
                 errorDetails: m.errorDetails || null,
+                source: m.source || null,
             };
         });
         io.to(tenantId).emit("messages_" + contactId, formatted);
@@ -5519,6 +6037,46 @@ async function runScheduledCampaigns() {
                     }
                 }
             );
+
+            // ── Trigger retry system (mirrors normal campaign behaviour) ────────────
+            // Schedule phase 1 (grace-period evaluation) so the RetryScheduler cron
+            // can pick up failed/undelivered messages after the configured interval.
+            // Returns null (no-op) when the campaign has zero retry phases configured.
+            try {
+                const scheduledPhase = await retryScheduler.schedulePhase(
+                    campaignId,
+                    1,           // phase 1 = grace-period evaluation
+                    new Date()   // completion time = now
+                );
+                if (scheduledPhase) {
+                    console.log(JSON.stringify({
+                        service: 'ScheduledCampaign',
+                        event: 'retry_phase1_scheduled',
+                        campaignId,
+                        scheduledAt: scheduledPhase.scheduledAt.toISOString(),
+                        message: 'Phase 1 grace-period evaluation scheduled for retry system',
+                        timestamp: new Date().toISOString()
+                    }));
+                } else {
+                    console.log(JSON.stringify({
+                        service: 'ScheduledCampaign',
+                        event: 'retry_phase1_skipped',
+                        campaignId,
+                        message: 'No retry phases configured — skipping retry scheduling',
+                        timestamp: new Date().toISOString()
+                    }));
+                }
+            } catch (retryErr) {
+                // Non-fatal: log the error but do not prevent the scheduled job from completing
+                console.error(JSON.stringify({
+                    service: 'ScheduledCampaign',
+                    event: 'retry_phase1_schedule_error',
+                    campaignId,
+                    error: retryErr.message,
+                    message: 'Failed to schedule retry phase 1 — campaign will not be retried',
+                    timestamp: new Date().toISOString()
+                }));
+            }
 
             // Emit progress updates to active dashboard rooms
             await broadcastCampaigns(sc.tenantId);
@@ -5929,7 +6487,12 @@ async function dispatchTemplate(tenantId, lead, trigger) {
         // Store outbound template message so it appears in the conversation/chat screen
         // Extract template body text from the already-fetched components
         const bodyComponent = (components || []).find(c => c.type === 'BODY');
-        const templateBodyText = bodyComponent?.text || null;
+        let templateBodyText = bodyComponent?.text || null;
+        if (templateBodyText && bodyParams && bodyParams.length) {
+            bodyParams.forEach((param, idx) => {
+                templateBodyText = templateBodyText.replace(new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g'), param.text || '');
+            });
+        }
         const contactName = lead.name || lead.mobileNumber;
         const previewText = buildPreview('template', { templateName: trigger.templateName, templateBody: templateBodyText });
 
@@ -5941,7 +6504,7 @@ async function dispatchTemplate(tenantId, lead, trigger) {
         await Message.create({
             tenantId,
             contactId: lead.mobileNumber,
-            text: templateBodyText || '',
+            text: templateBodyText || `📋 Template: ${trigger.templateName}`,
             isMe: true,
             time: new Date().toISOString(),
             messageType: 'template',
@@ -6108,7 +6671,14 @@ async function evaluateClientTrigger(tenantId, client) {
         }
 
         // Step 6: Upsert Conversation and create Message document
-        const templateLabel = `📋 Template: ${trigger.templateName}`;
+        const bodyComponent = (tplComponents || []).find(c => c.type === 'BODY');
+        let templateBodyText = bodyComponent?.text || null;
+        if (templateBodyText && bodyParams && bodyParams.length) {
+            bodyParams.forEach((param, idx) => {
+                templateBodyText = templateBodyText.replace(new RegExp(`\\{\\{${idx + 1}\\}\\}`, 'g'), param.text || '');
+            });
+        }
+        const templateLabel = templateBodyText || `📋 Template: ${trigger.templateName}`;
         const contactName = client.name || client.mobileNumber;
         await Conversation.findOneAndUpdate(
             { tenantId, contactId: client.mobileNumber },
@@ -6120,8 +6690,9 @@ async function evaluateClientTrigger(tenantId, client) {
             contactId: client.mobileNumber,
             text: templateLabel,
             isMe: true,
-            role: 'assistant',
-            type: 'template',
+            messageType: 'template',
+            templateName: trigger.templateName,
+            templateBody: templateBodyText,
             time: new Date().toISOString(),
             wamid: wamid || null,
             status: 'sent',
