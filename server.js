@@ -63,6 +63,11 @@ const tenantSchema = new mongoose.Schema({
         onboardedAt: Date,              // Timestamp when PARTNER_ADDED webhook fired (Step 3)
         verified: { type: Boolean, default: false },
         templateRejections: { type: Map, of: String, default: {} }, // Map of templateName -> rejectionReason
+        nameApprovalStatus: { type: String, default: 'UNKNOWN' }, // APPROVED | PENDING_REVIEW | DECLINED
+        codeVerificationStatus: { type: String, default: 'UNKNOWN' }, // VERIFIED | NOT_VERIFIED
+        phoneStatus: { type: String, default: 'PENDING' }, // CONNECTED | PENDING | UNREGISTERED | RESTRICTED
+        registrationPin: { type: String, default: '123456' },
+        registrationError: { type: mongoose.Schema.Types.Mixed, default: null },
         // ── Token health tracking ────────────────────────────────────────────
         tokenExpiry: { type: Date, default: null },   // null = never expires (system user token)
         tokenType: { type: String, default: 'user' }, // 'user' | 'system_user'
@@ -1497,20 +1502,28 @@ app.get('/me', authenticate, async (req, res) => {
 });
 
 app.post('/update-config', authenticate, async (req, res) => {
-    const { phoneNumberId, accessToken, businessAccountId, metaAppId } = req.body;
+    const { phoneNumberId, accessToken, businessAccountId, metaAppId, displayPhone, verifiedName, qualityRating, throughputLevel } = req.body;
     try {
-        await Tenant.findByIdAndUpdate(req.user.tenantId, {
-            'whatsappConfig.phoneNumberId': phoneNumberId,
-            'whatsappConfig.accessToken': accessToken,
-            'whatsappConfig.businessAccountId': businessAccountId,
-            'whatsappConfig.metaAppId': metaAppId,
+        const updateFields = {
             'whatsappConfig.verified': true,
-        });
+        };
+        if (phoneNumberId !== undefined) updateFields['whatsappConfig.phoneNumberId'] = phoneNumberId;
+        if (accessToken !== undefined) updateFields['whatsappConfig.accessToken'] = accessToken;
+        if (businessAccountId !== undefined) updateFields['whatsappConfig.businessAccountId'] = businessAccountId;
+        if (metaAppId !== undefined) updateFields['whatsappConfig.metaAppId'] = metaAppId;
+        if (displayPhone !== undefined) updateFields['whatsappConfig.displayPhone'] = displayPhone;
+        if (verifiedName !== undefined) updateFields['whatsappConfig.verifiedName'] = verifiedName;
+        if (qualityRating !== undefined) updateFields['whatsappConfig.qualityRating'] = qualityRating;
+        if (throughputLevel !== undefined) updateFields['whatsappConfig.throughputLevel'] = throughputLevel;
+
+        await Tenant.findByIdAndUpdate(req.user.tenantId, { $set: updateFields });
         res.json({ success: true, message: 'Configuration updated' });
     } catch (error) {
         res.status(500).json({ error: 'Failed to update configuration' });
     }
 });
+
+
 
 // GET /onboarding-status — Checks verification status dynamically from Meta and templates setup
 app.get('/onboarding-status', authenticate, async (req, res) => {
@@ -2915,6 +2928,8 @@ app.get('/campaign-analytics', authenticate, async (req, res) => {
     }
 });
 
+
+
 //  Scheduled Campaigns 
 app.post('/scheduled-campaigns', authenticate, async (req, res) => {
     try {
@@ -3107,6 +3122,44 @@ app.post('/status-mappings', authenticate, async (req, res) => {
 });
 
 
+/**
+ * Registers a phone number with Meta WhatsApp Cloud API via POST /{PHONE_NUMBER_ID}/register.
+ * This provisions the WhatsApp Cloud API container and transitions phone status from PENDING to CONNECTED.
+ * 
+ * @param {string} phoneNumberId - Meta Phone Number ID
+ * @param {string} accessToken   - System User or Valid Access Token
+ * @param {string} pin           - 6-digit registration PIN (default: '123456')
+ */
+async function registerPhoneNumber(phoneNumberId, accessToken, pin = '123456') {
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const url = `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/register`;
+
+    console.log(`[registerPhoneNumber] Attempting Meta Cloud API registration for Phone ID: ${phoneNumberId}...`);
+
+    try {
+        const response = await axios.post(
+            url,
+            {
+                messaging_product: 'whatsapp',
+                pin: pin || '123456',
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json',
+                },
+            }
+        );
+
+        console.log(`[registerPhoneNumber] ✅ Phone ID ${phoneNumberId} successfully registered with Meta Cloud API:`, response.data);
+        return { success: true, data: response.data };
+    } catch (err) {
+        const errData = err.response?.data || err.message;
+        console.error(`[registerPhoneNumber] ❌ Registration failed for Phone ID ${phoneNumberId}:`, JSON.stringify(errData, null, 2));
+        return { success: false, error: errData };
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  META ONBOARDING HELPER — Steps 4 + 5 + 6
 //  Called from:
@@ -3244,13 +3297,17 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
         let verifiedName = null;
         let qualityRating = null;
         let throughputLevel = null;
+        let nameApprovalStatus = 'UNKNOWN';
+        let codeVerificationStatus = 'UNKNOWN';
+        let phoneStatus = 'PENDING';
+        let registrationError = null;
 
         try {
             const phoneRes = await axios.get(
                 `https://graph.facebook.com/${apiVersion}/${wabaId}/phone_numbers`,
                 {
                     params: {
-                        fields: 'id,display_phone_number,verified_name,code_verification_status,quality_rating,platform_type,throughput,last_onboarded_time,webhook_configuration',
+                        fields: 'id,display_phone_number,verified_name,code_verification_status,name_approval_status,status,quality_rating,platform_type,throughput,last_onboarded_time,webhook_configuration',
                         access_token: tokenForPhoneQuery,
                     },
                 }
@@ -3264,6 +3321,9 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
                 verifiedName = phone.verified_name;
                 qualityRating = phone.quality_rating;
                 throughputLevel = phone.throughput?.level;
+                nameApprovalStatus = phone.name_approval_status || 'UNKNOWN';
+                codeVerificationStatus = phone.code_verification_status || 'UNKNOWN';
+                phoneStatus = phone.status || 'PENDING';
 
                 await saveOnboardingLog({
                     tenantId,
@@ -3272,9 +3332,63 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
                     phoneNumberId,
                     step: 'ONBOARDING_PROCESS_FETCH_PHONE_SUCCESS',
                     status: 'success',
-                    message: `Step 6: Phone details fetched successfully: ${displayPhone} (Quality: ${qualityRating || 'N/A'}, Throughput: ${throughputLevel || 'N/A'})`,
+                    message: `Step 6: Phone details fetched successfully: ${displayPhone} (CodeVerif: ${codeVerificationStatus}, NameApproval: ${nameApprovalStatus}, Status: ${phoneStatus})`,
                     details: phone
                 });
+
+                // ── STEP 6.5: EXECUTE META PHONE NUMBER REGISTRATION API ──────────
+                // If code_verification_status is VERIFIED or name_approval_status is APPROVED,
+                // call POST /{PHONE_NUMBER_ID}/register to transition status from PENDING to CONNECTED.
+                const tokenForRegistration = businessToken || systemToken;
+                if (phoneNumberId && tokenForRegistration && (codeVerificationStatus === 'VERIFIED' || nameApprovalStatus === 'APPROVED')) {
+                    await saveOnboardingLog({
+                        tenantId,
+                        sessionId,
+                        wabaId,
+                        phoneNumberId,
+                        step: 'ONBOARDING_PROCESS_REGISTER_PHONE_START',
+                        status: 'info',
+                        message: `Triggering Meta Cloud API phone registration for Phone ID ${phoneNumberId}...`
+                    });
+
+                    const regResult = await registerPhoneNumber(phoneNumberId, tokenForRegistration, '123456');
+
+                    if (regResult.success) {
+                        phoneStatus = 'CONNECTED';
+                        await saveOnboardingLog({
+                            tenantId,
+                            sessionId,
+                            wabaId,
+                            phoneNumberId,
+                            step: 'ONBOARDING_PROCESS_REGISTER_PHONE_SUCCESS',
+                            status: 'success',
+                            message: `Meta Cloud API registration succeeded! Phone ID ${phoneNumberId} is now CONNECTED.`,
+                            details: regResult.data
+                        });
+                    } else {
+                        registrationError = regResult.error;
+                        await saveOnboardingLog({
+                            tenantId,
+                            sessionId,
+                            wabaId,
+                            phoneNumberId,
+                            step: 'ONBOARDING_PROCESS_REGISTER_PHONE_FAIL',
+                            status: 'error',
+                            message: `Meta Cloud API registration failed for Phone ID ${phoneNumberId}. Phone remains in PENDING state.`,
+                            details: regResult.error
+                        });
+                    }
+                } else {
+                    await saveOnboardingLog({
+                        tenantId,
+                        sessionId,
+                        wabaId,
+                        phoneNumberId,
+                        step: 'ONBOARDING_PROCESS_REGISTER_PHONE_SKIPPED',
+                        status: 'warning',
+                        message: `Skipped auto-registration: code_verification_status=${codeVerificationStatus}, name_approval_status=${nameApprovalStatus}.`
+                    });
+                }
             } else {
                 await saveOnboardingLog({
                     tenantId,
@@ -3299,11 +3413,16 @@ async function processOnboarding(wabaId, businessPortfolioId, tenantId, sessionI
         }
 
         // ── Step 7: Persist to MongoDB ──────────────────────────────────────
+        const isFullyVerified = !!(businessToken && phoneNumberId && phoneStatus === 'CONNECTED');
         const updateFields = {
             'whatsappConfig.businessAccountId': wabaId,
             'whatsappConfig.businessPortfolioId': businessPortfolioId,
             'whatsappConfig.onboardedAt': new Date(),
-            'whatsappConfig.verified': !!(businessToken && phoneNumberId),
+            'whatsappConfig.verified': isFullyVerified,
+            'whatsappConfig.nameApprovalStatus': nameApprovalStatus,
+            'whatsappConfig.codeVerificationStatus': codeVerificationStatus,
+            'whatsappConfig.phoneStatus': phoneStatus,
+            'whatsappConfig.registrationError': registrationError,
             // Token health: system user tokens from this step never expire
             'whatsappConfig.tokenType': businessToken ? 'system_user' : 'user',
             'whatsappConfig.tokenExpiry': null,   // null = never expires
@@ -3425,6 +3544,56 @@ app.post('/log-signup-event', authenticate, async (req, res) => {
     } catch (err) {
         console.error('Error logging signup event:', err.message);
         res.status(500).json({ error: 'Failed to write log' });
+    }
+});
+
+// POST /api/whatsapp/register-phone — Manual trigger to register phone number with Meta Cloud API
+app.post('/api/whatsapp/register-phone', authenticate, async (req, res) => {
+    try {
+        const tenantId = req.user.tenantId;
+        const tenant = await Tenant.findById(tenantId);
+
+        if (!tenant || !tenant.whatsappConfig?.phoneNumberId || !tenant.whatsappConfig?.accessToken) {
+            return res.status(400).json({ error: 'WhatsApp configuration (phoneNumberId or accessToken) is missing.' });
+        }
+
+        const { phoneNumberId, accessToken } = tenant.whatsappConfig;
+        const pin = req.body.pin || tenant.whatsappConfig.registrationPin || '123456';
+
+        console.log(`[POST /api/whatsapp/register-phone] Triggering manual Meta registration for Tenant ${tenantId}, Phone ID ${phoneNumberId}...`);
+
+        const result = await registerPhoneNumber(phoneNumberId, accessToken, pin);
+
+        if (result.success) {
+            await Tenant.findByIdAndUpdate(tenantId, {
+                $set: {
+                    'whatsappConfig.phoneStatus': 'CONNECTED',
+                    'whatsappConfig.verified': true,
+                    'whatsappConfig.registrationPin': pin,
+                    'whatsappConfig.registrationError': null,
+                }
+            });
+            return res.json({
+                success: true,
+                message: 'Phone number registered successfully with Meta Cloud API!',
+                data: result.data,
+            });
+        } else {
+            await Tenant.findByIdAndUpdate(tenantId, {
+                $set: {
+                    'whatsappConfig.phoneStatus': 'PENDING',
+                    'whatsappConfig.verified': false,
+                    'whatsappConfig.registrationError': result.error,
+                }
+            });
+            return res.status(500).json({
+                error: 'Meta Phone Registration Failed',
+                details: result.error,
+            });
+        }
+    } catch (err) {
+        console.error('[POST /api/whatsapp/register-phone] Error:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -5589,6 +5758,57 @@ app.post('/webhook', async (req, res) => {
                     }
                 }).catch(err => {
                     console.error('[Webhook] Error handling template status update:', err);
+                });
+                return; // already sent 200
+            }
+
+            if (change.field === 'phone_number_name_update') {
+                res.sendStatus(200); // Respond immediately to Meta
+                const phoneNumberId = val?.display_phone_number_id || val?.phone_number_id;
+                const decision = val?.decision; // APPROVED | DECLINED
+                const requestedName = val?.requested_verified_name;
+
+                console.log(`[Webhook] phone_number_name_update for Phone ID ${phoneNumberId}: decision=${decision}, name=${requestedName}`);
+
+                Tenant.findOne({ 'whatsappConfig.phoneNumberId': phoneNumberId }).then(async (tenant) => {
+                    if (tenant) {
+                        const tenantId = tenant._id.toString();
+                        const accessToken = tenant.whatsappConfig.accessToken;
+
+                        await Tenant.findByIdAndUpdate(tenantId, {
+                            $set: {
+                                'whatsappConfig.nameApprovalStatus': decision,
+                                'whatsappConfig.verifiedName': requestedName || tenant.whatsappConfig.verifiedName,
+                            }
+                        });
+
+                        if (decision === 'APPROVED' && accessToken) {
+                            console.log(`[Webhook] Display name APPROVED for Phone ID ${phoneNumberId}. Triggering auto-registration...`);
+                            const regResult = await registerPhoneNumber(phoneNumberId, accessToken, tenant.whatsappConfig.registrationPin || '123456');
+
+                            if (regResult.success) {
+                                await Tenant.findByIdAndUpdate(tenantId, {
+                                    $set: {
+                                        'whatsappConfig.phoneStatus': 'CONNECTED',
+                                        'whatsappConfig.verified': true,
+                                        'whatsappConfig.registrationError': null,
+                                    }
+                                });
+                                console.log(`[Webhook] ✅ Phone ID ${phoneNumberId} auto-registered and CONNECTED upon name approval.`);
+                            } else {
+                                await Tenant.findByIdAndUpdate(tenantId, {
+                                    $set: {
+                                        'whatsappConfig.registrationError': regResult.error,
+                                    }
+                                });
+                                console.error(`[Webhook] ❌ Phone ID ${phoneNumberId} auto-registration failed:`, regResult.error);
+                            }
+                        }
+                    } else {
+                        console.warn(`[Webhook] Received phone_number_name_update for Phone ID ${phoneNumberId} but no tenant found.`);
+                    }
+                }).catch(err => {
+                    console.error('[Webhook] Error handling phone_number_name_update:', err);
                 });
                 return; // already sent 200
             }
