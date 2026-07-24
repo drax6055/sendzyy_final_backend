@@ -99,7 +99,7 @@ const PANEL_PLANS = [
     { id: 'panel_1m', name: '1 Month Access', description: '1 month full panel access', basePrice: Math.round(1499 / 1.18), gstPercent: 18, totalPrice: 1499, panelDays: 30 },
     { id: 'panel_3m', name: '3 Month Access', description: '3 months full panel access', basePrice: Math.round(3999 / 1.18), gstPercent: 18, totalPrice: 3999, panelDays: 90 },
     { id: 'panel_6m', name: '6 Month Access', description: '6 months full panel access', basePrice: Math.round(7499 / 1.18), gstPercent: 18, totalPrice: 7499, panelDays: 180 },
-    { id: 'panel_12m', name: '12 Month Access', description: '12 months full panel access', basePrice: Math.round(11999 / 1.18), gstPercent: 18, totalPrice: 11999, panelDays: 365 },
+    { id: 'panel_12m', name: '12 Month Access', description: '12 months full panel access', basePrice: Math.round(14999 / 1.18), gstPercent: 18, totalPrice: 14999, panelDays: 365 },
 ];
 
 function getPlanById(planId) {
