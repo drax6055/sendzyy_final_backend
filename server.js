@@ -1530,19 +1530,19 @@ app.get('/onboarding-status', authenticate, async (req, res) => {
     try {
         const tenant = await Tenant.findById(req.user.tenantId);
         if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
-        
+
         const config = tenant.whatsappConfig || {};
         const wabaId = config.businessAccountId;
         const accessToken = config.accessToken;
         const phoneId = config.phoneNumberId;
-        
+
         const status = {
             whatsappConnected: !!(wabaId && accessToken),
             phoneVerified: !!phoneId,
             metaBusinessVerified: 'NOT_VERIFIED', // VERIFIED | PENDING | NOT_VERIFIED
             hasApprovedTemplate: false
         };
-        
+
         if (status.whatsappConnected) {
             try {
                 const wabaRes = await axios.get(
@@ -1554,7 +1554,7 @@ app.get('/onboarding-status', authenticate, async (req, res) => {
                         }
                     }
                 );
-                
+
                 const metaStatus = wabaRes.data?.business_verification_status;
                 if (metaStatus === 'verified') {
                     status.metaBusinessVerified = 'VERIFIED';
@@ -1566,7 +1566,7 @@ app.get('/onboarding-status', authenticate, async (req, res) => {
             } catch (err) {
                 console.error('[OnboardingStatus] Failed to fetch business_verification_status:', err.response?.data || err.message);
             }
-            
+
             try {
                 const templatesRes = await axios.get(
                     `${WHATSAPP_API_URL}/${wabaId}/message_templates`,
@@ -1583,7 +1583,7 @@ app.get('/onboarding-status', authenticate, async (req, res) => {
                 console.error('[OnboardingStatus] Failed to fetch message templates:', err.response?.data || err.message);
             }
         }
-        
+
         res.json(status);
     } catch (error) {
         console.error('[OnboardingStatus] Fatal error:', error);
@@ -1596,10 +1596,10 @@ app.get('/template-rejection-reason/:name', authenticate, async (req, res) => {
     try {
         const tenant = await Tenant.findById(req.user.tenantId);
         if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
-        
+
         const templateName = req.params.name;
         const savedReason = tenant.whatsappConfig?.templateRejections?.get(templateName) || null;
-        
+
         res.json({ name: templateName, reason: savedReason });
     } catch (error) {
         console.error('[TemplateRejectionReason] Error:', error);
@@ -2502,10 +2502,10 @@ app.get('/campaigns', authenticate, async (req, res) => {
                 recipientCounts[cid] = { sent: 0, delivered: 0, read: 0, failed: 0, total: 0 };
             }
             recipientCounts[cid].total += row.count;
-            if (status === 'sent')      recipientCounts[cid].sent      += row.count;
+            if (status === 'sent') recipientCounts[cid].sent += row.count;
             if (status === 'delivered') recipientCounts[cid].delivered += row.count;
-            if (status === 'read')      recipientCounts[cid].read      += row.count;
-            if (status === 'failed')    recipientCounts[cid].failed    += row.count;
+            if (status === 'read') recipientCounts[cid].read += row.count;
+            if (status === 'failed') recipientCounts[cid].failed += row.count;
         }
 
         const enriched = campaigns.map(c => {
@@ -2515,11 +2515,11 @@ app.get('/campaigns', authenticate, async (req, res) => {
             // If recipient docs exist, override campaign-level counters with live values.
             // deliveredCount includes messages that were later "read" (delivery is implied).
             if (rc && rc.total > 0) {
-                base.totalCount     = rc.total;
-                base.successCount   = rc.total - rc.failed;          // non-failed = sent/delivered/read
-                base.failureCount   = rc.failed;
+                base.totalCount = rc.total;
+                base.successCount = rc.total - rc.failed;          // non-failed = sent/delivered/read
+                base.failureCount = rc.failed;
                 base.deliveredCount = rc.delivered + rc.read;        // delivered still counts as delivered
-                base.readCount      = rc.read;
+                base.readCount = rc.read;
             }
             // else: campaign doc fields remain as-is (campaign still dispatching, no recipients yet)
 
@@ -2953,7 +2953,7 @@ app.post('/scheduled-campaigns', authenticate, async (req, res) => {
 app.get('/scheduled-campaigns', authenticate, async (req, res) => {
     try {
         const list = await ScheduledCampaign.find({ tenantId: req.user.tenantId }).sort({ scheduledAt: -1 });
-        
+
         // Compute accurate live counts from the Recipient collection (ground truth)
         const campaignIds = list.map(s => s.resultCampaignId || `sched_${s._id}`);
         const recipientAgg = await Recipient.aggregate([
@@ -2974,10 +2974,10 @@ app.get('/scheduled-campaigns', authenticate, async (req, res) => {
                 recipientCounts[cid] = { sent: 0, delivered: 0, read: 0, failed: 0, total: 0 };
             }
             recipientCounts[cid].total += row.count;
-            if (status === 'sent')      recipientCounts[cid].sent      += row.count;
+            if (status === 'sent') recipientCounts[cid].sent += row.count;
             if (status === 'delivered') recipientCounts[cid].delivered += row.count;
-            if (status === 'read')      recipientCounts[cid].read      += row.count;
-            if (status === 'failed')    recipientCounts[cid].failed    += row.count;
+            if (status === 'read') recipientCounts[cid].read += row.count;
+            if (status === 'failed') recipientCounts[cid].failed += row.count;
         }
 
         const enriched = list.map(s => {
@@ -4280,7 +4280,7 @@ app.post('/upload-media', authenticate, async (req, res) => {
                 if (Array.isArray(parsed)) {
                     processedFileData = Buffer.from(parsed);
                 }
-            } catch (_) {}
+            } catch (_) { }
         }
 
         const initResponse = await axios.post(`${WHATSAPP_API_URL}/${appId}/uploads`, null, {
@@ -4313,7 +4313,7 @@ app.post('/media-upload', authenticate, async (req, res) => {
                 if (Array.isArray(parsed)) {
                     processedFileData = Buffer.from(parsed);
                 }
-            } catch (_) {}
+            } catch (_) { }
         }
 
         const FormData = require('form-data');
@@ -4442,7 +4442,7 @@ async function handleMetaAuth401(tenantId) {
                     console.error(`[handleMetaAuth401] Email notification failed for tenant ${tenantId}:`, emailErr.message);
                 });
             }
-        }).catch(() => {});
+        }).catch(() => { });
 
         console.error(` [Auth401] Token expired for tenant ${tenantId} — chatbots deactivated, token marked expired, notification sent.`);
     } catch (err) {
@@ -4482,7 +4482,7 @@ async function sendChatbotText(tenant, to, text, chatbotId) {
             messageType: 'text',
             source: 'chatbot',
             previewText: '⚠️ Failed to send message',
-        }).catch(() => {});
+        }).catch(() => { });
         return false; // WhatsApp send failed — do not advance the flow
     }
 
@@ -4596,8 +4596,8 @@ async function saveChatbotMessageToDB({
     );
 
     // 3. Broadcast to socket (non-blocking)
-    broadcastMessages(tenantId, contactId).catch(() => {});
-    broadcastConversations(tenantId).catch(() => {});
+    broadcastMessages(tenantId, contactId).catch(() => { });
+    broadcastConversations(tenantId).catch(() => { });
 }
 
 // Helper — re-send the prompt for the current node (used by media guard and condition fallback)
@@ -4950,7 +4950,7 @@ async function handleQuickReplyNode(session, node, tenant, from) {
             messageType: 'text',
             source: 'chatbot',
             previewText: '⚠️ Failed to send buttons',
-        }).catch(() => {});
+        }).catch(() => { });
         return; // WhatsApp API failed — do not set session state
     }
 }
@@ -5064,7 +5064,7 @@ async function handleListMessageNode(session, node, tenant, from) {
             messageType: 'text',
             source: 'chatbot',
             previewText: '⚠️ Failed to send list menu',
-        }).catch(() => {});
+        }).catch(() => { });
         return; // WhatsApp API failed — do not set session state
     }
 }
@@ -5165,8 +5165,8 @@ async function handleActionNode(session, node, tenant, from) {
                         messaging_product: 'whatsapp',
                         to: from,
                         type: 'template',
-                        template: { 
-                            name: templateName, 
+                        template: {
+                            name: templateName,
                             language: { code: language },
                             ...(components.length ? { components } : {})
                         },
@@ -5216,7 +5216,7 @@ async function handleActionNode(session, node, tenant, from) {
                     messageType: 'text',
                     source: 'chatbot',
                     previewText: `⚠️ Failed to send template: ${templateName}`,
-                }).catch(() => {});
+                }).catch(() => { });
                 // Do not return — allow flow to advance so session doesn't get stuck
             }
         }
@@ -5299,7 +5299,7 @@ async function chatbotEngineProcessMessage(tenantId, message, profileName, from,
                     source: 'chatbot_reply',
                     previewText: `[${msgType || 'media'} — not supported in chatbot]`,
                     name: profileName,
-                }).catch(() => {}); // Best-effort; never block the guard response
+                }).catch(() => { }); // Best-effort; never block the guard response
 
                 await sendChatbotText(tenant, from, 'Please reply with text.', session.chatbotId);
                 // Re-send current node prompt
@@ -5475,7 +5475,7 @@ setInterval(async () => {
 
         for (const session of expiredSessions) {
             const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
-            
+
             // 1. Increment droppedSessions analytics
             await ChatbotAnalytics.findOneAndUpdate(
                 { tenantId: session.tenantId, chatbotId: session.chatbotId, date: todayDate },
@@ -5492,7 +5492,7 @@ setInterval(async () => {
                 messageType: 'text',
                 source: 'chatbot',
                 previewText: 'Chatbot session ended due to inactivity.',
-            }).catch(() => {});
+            }).catch(() => { });
 
             // 3. Delete session
             await ChatbotSession.deleteOne({ _id: session._id });
@@ -5729,7 +5729,7 @@ app.post('/webhook', async (req, res) => {
                 Tenant.findOne({ 'whatsappConfig.businessAccountId': wabaId }).then(async (tenant) => {
                     if (tenant) {
                         const tenantId = tenant._id.toString();
-                        
+
                         // Update our local cache of template rejection reasons if template was rejected
                         if (eventStatus === 'REJECTED' && reason) {
                             if (!tenant.whatsappConfig.templateRejections) {
@@ -6536,35 +6536,39 @@ app.post('/api/leads/:id/merge', authenticate, async (req, res) => {
  * Requirements: 7.1-7.8
  */
 async function evaluateTriggers(tenantId, lead) {
-    // 7.5 — Skip for duplicate leads
-    if (lead.isDuplicate) return;
+    try {
+        // 7.5 — Skip for duplicate leads
+        if (lead.isDuplicate) return;
 
-    // 7.1 — Query matching active triggers
-    const triggers = await LeadTrigger.find({
-        tenantId,
-        isActive: true,
-        $or: [
-            { source: 'any' },
-            { source: lead.source },
-        ],
-    });
+        // 7.1 — Query matching active triggers
+        const triggers = await LeadTrigger.find({
+            tenantId,
+            isActive: true,
+            $or: [
+                { source: 'any' },
+                { source: lead.source },
+            ],
+        });
 
-    const matchingTriggers = triggers.filter(trigger => {
-        // formName filter: if trigger has formName set, it must match lead's formName
-        if (trigger.formName && trigger.formName !== lead.formName) return false;
-        return true;
-    });
+        const matchingTriggers = triggers.filter(trigger => {
+            // formName filter: if trigger has formName set, it must match lead's formName
+            if (trigger.formName && trigger.formName !== lead.formName) return false;
+            return true;
+        });
 
-    for (const trigger of matchingTriggers) {
-        try {
-            if (trigger.action === 'send_template') {
-                await dispatchTemplate(tenantId, lead, trigger);
-            } else if (trigger.action === 'start_chatbot') {
-                await dispatchChatbot(tenantId, lead, trigger);
+        for (const trigger of matchingTriggers) {
+            try {
+                if (trigger.action === 'send_template') {
+                    await dispatchTemplate(tenantId, lead, trigger);
+                } else if (trigger.action === 'start_chatbot') {
+                    await dispatchChatbot(tenantId, lead, trigger);
+                }
+            } catch (err) {
+                console.error(`[AutoTrigger] Error executing trigger ${trigger._id}:`, err.message);
             }
-        } catch (err) {
-            console.error(`[AutoTrigger] Error executing trigger ${trigger._id}:`, err.message);
         }
+    } catch (err) {
+        console.error(`[AutoTrigger] Error evaluating triggers for lead ${lead._id}:`, err.message);
     }
 }
 
@@ -6618,72 +6622,72 @@ async function fetchTemplateComponents(tenant, templateName) {
  * 7.2 — Send WhatsApp template via Meta Cloud API v25.0
  */
 async function dispatchTemplate(tenantId, lead, trigger) {
-    // 7.6 — Skip if whatsappConfig is incomplete
-    const tenant = await Tenant.findById(tenantId);
-    if (!tenant || !tenant.whatsappConfig || !tenant.whatsappConfig.phoneNumberId || !tenant.whatsappConfig.accessToken) {
-        console.warn(`[AutoTrigger] Tenant ${tenantId} has incomplete whatsappConfig — skipping dispatch`);
-        return;
-    }
+    try {
+        // 7.6 — Skip if whatsappConfig is incomplete
+        const tenant = await Tenant.findById(tenantId);
+        if (!tenant || !tenant.whatsappConfig || !tenant.whatsappConfig.phoneNumberId || !tenant.whatsappConfig.accessToken) {
+            console.warn(`[AutoTrigger] Tenant ${tenantId} has incomplete whatsappConfig — skipping dispatch`);
+            return;
+        }
 
-    const { phoneNumberId, accessToken } = tenant.whatsappConfig;
-    const url = `${WHATSAPP_API_URL}/${phoneNumberId}/messages`;
+        const { phoneNumberId, accessToken } = tenant.whatsappConfig;
+        const url = `${WHATSAPP_API_URL}/${phoneNumberId}/messages`;
 
-    // Resolve body variables
-    const components = await fetchTemplateComponents(tenant, trigger.templateName);
-    const varCount = extractVariableCount(components);
-    const mapping = trigger.variableMapping || {};
+        // Resolve body variables
+        const components = await fetchTemplateComponents(tenant, trigger.templateName);
+        const varCount = extractVariableCount(components);
+        const mapping = trigger.variableMapping || {};
 
-    // Auto-fill any unmapped positions with lead fields in order
-    const autoFields = ['name', 'mobileNumber', 'email', 'companyName', 'formName'];
-    const resolvedMapping = { ...mapping };
-    if (varCount > 0) {
-        let autoIdx = 0;
-        for (let i = 1; i <= varCount; i++) {
-            if (!resolvedMapping[String(i)]) {
-                resolvedMapping[String(i)] = autoFields[autoIdx] || 'name';
-                autoIdx++;
+        // Auto-fill any unmapped positions with lead fields in order
+        const autoFields = ['name', 'mobileNumber', 'email', 'companyName', 'formName'];
+        const resolvedMapping = { ...mapping };
+        if (varCount > 0) {
+            let autoIdx = 0;
+            for (let i = 1; i <= varCount; i++) {
+                if (!resolvedMapping[String(i)]) {
+                    resolvedMapping[String(i)] = autoFields[autoIdx] || 'name';
+                    autoIdx++;
+                }
             }
         }
-    }
 
-    const bodyParams = resolveVariables(resolvedMapping, {
-        name: lead.name || '',
-        mobileNumber: lead.mobileNumber || '',
-        email: lead.email || '',
-        companyName: lead.companyName || '',
-        formName: lead.formName || '',
-        source: lead.source || '',
-        ...Object.fromEntries(
-            Object.entries(lead.metadata || {}).map(([k, v]) => [`metadata.${k}`, v])
-        ),
-    });
-
-    const body = {
-        messaging_product: 'whatsapp',
-        to: lead.mobileNumber,
-        type: 'template',
-        template: {
-            name: trigger.templateName,
-            language: { code: trigger.templateLanguage || 'en_US' },
-        },
-    };
-
-    const templateComponents = [];
-    if (trigger.mediaId) {
-        const mediaType = (trigger.mediaType || 'image').toLowerCase();
-        templateComponents.push({
-            type: 'header',
-            parameters: [{ type: mediaType, [mediaType]: { id: trigger.mediaId } }],
+        const bodyParams = resolveVariables(resolvedMapping, {
+            name: lead.name || '',
+            mobileNumber: lead.mobileNumber || '',
+            email: lead.email || '',
+            companyName: lead.companyName || '',
+            formName: lead.formName || '',
+            source: lead.source || '',
+            ...Object.fromEntries(
+                Object.entries(lead.metadata || {}).map(([k, v]) => [`metadata.${k}`, v])
+            ),
         });
-    }
-    if (bodyParams.length) {
-        templateComponents.push({ type: 'body', parameters: bodyParams });
-    }
-    if (templateComponents.length) {
-        body.template.components = templateComponents;
-    }
 
-    try {
+        const body = {
+            messaging_product: 'whatsapp',
+            to: lead.mobileNumber,
+            type: 'template',
+            template: {
+                name: trigger.templateName,
+                language: { code: trigger.templateLanguage || 'en_US' },
+            },
+        };
+
+        const templateComponents = [];
+        if (trigger.mediaId) {
+            const mediaType = (trigger.mediaType || 'image').toLowerCase();
+            templateComponents.push({
+                type: 'header',
+                parameters: [{ type: mediaType, [mediaType]: { id: trigger.mediaId } }],
+            });
+        }
+        if (bodyParams.length) {
+            templateComponents.push({ type: 'body', parameters: bodyParams });
+        }
+        if (templateComponents.length) {
+            body.template.components = templateComponents;
+        }
+
         const response = await axios.post(url, body, {
             headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
         });
@@ -6705,7 +6709,6 @@ async function dispatchTemplate(tenantId, lead, trigger) {
         await Lead.findByIdAndUpdate(lead._id, { status: 'contacted' });
 
         // Store outbound template message so it appears in the conversation/chat screen
-        // Extract template body text from the already-fetched components
         const bodyComponent = (components || []).find(c => c.type === 'BODY');
         let templateBodyText = bodyComponent?.text || null;
         if (templateBodyText && bodyParams && bodyParams.length) {
@@ -6737,9 +6740,11 @@ async function dispatchTemplate(tenantId, lead, trigger) {
         await broadcastMessages(tenantId, lead.mobileNumber);
     } catch (err) {
         const metaCode = err.response?.data?.error?.code || 'unknown';
-        console.error(`[AutoTrigger] Meta API error for lead ${lead._id}: code=${metaCode}`, err.response?.data);
+        console.error(`[AutoTrigger] Meta API error for lead ${lead._id}: code=${metaCode}`, err.response?.data || err.message);
         // 7.4 — Update status to failed on Meta API error
-        await Lead.findByIdAndUpdate(lead._id, { status: 'failed' });
+        try {
+            await Lead.findByIdAndUpdate(lead._id, { status: 'failed' });
+        } catch (_) {}
     }
 }
 
@@ -7056,8 +7061,12 @@ app.post('/api/leads/webhook/:tenantId', webhookRateLimiter, async (req, res) =>
         // 6.8 — Log webhook request to WebhookLogs (async, after response)
         WebhookLog.create({ tenantId, sourceIp, httpStatus: 200 }).catch(console.error);
 
-        // 7.7 — Evaluate triggers asynchronously after returning HTTP 200
-        evaluateTriggers(tenantId, lead).catch(console.error);
+        // 7.7 — Evaluate triggers asynchronously after returning HTTP 200 (decoupled via setImmediate)
+        setImmediate(() => {
+            evaluateTriggers(tenantId, lead).catch(err => {
+                console.error(`[AutoTrigger] Async trigger error for lead ${lead._id}:`, err.message);
+            });
+        });
 
     } catch (err) {
         console.error('Webhook error:', err);
