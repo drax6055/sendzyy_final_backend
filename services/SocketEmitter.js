@@ -29,6 +29,10 @@ const SocketEmitter = {
      */
     setIo(io) {
         _io = io;
+        this._io = io;
+    },
+    get _io() {
+        return _io;
     },
 
     /**

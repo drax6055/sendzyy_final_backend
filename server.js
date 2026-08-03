@@ -451,7 +451,48 @@ const groupSchema = new mongoose.Schema({
 groupSchema.index({ tenantId: 1 });
 const Group = mongoose.model('Group', groupSchema);
 
-// ── Retry / Campaign Lifecycle Services ──────────────────────────────────────
+// ── Notification System Schemas ──────────────────────────────────────────────
+const notificationSchema = new mongoose.Schema({
+    tenantId: { type: String, required: true, index: true },
+    userId: { type: String, default: null },
+    title: { type: String, required: true },
+    body: { type: String, required: true },
+    icon: { type: String, default: null },
+    imageUrl: { type: String, default: null },
+    type: { type: String, required: true, default: 'system' },
+    category: { type: String, required: true, default: 'system' },
+    actionData: { type: mongoose.Schema.Types.Mixed, default: {} },
+    isRead: { type: Boolean, default: false, index: true },
+    readAt: { type: Date, default: null },
+    isDeleted: { type: Boolean, default: false },
+    fcmMessageId: { type: String, default: null },
+    deliveredAt: { type: Date, default: null },
+    pushSent: { type: Boolean, default: false },
+}, { timestamps: true });
+
+notificationSchema.index({ tenantId: 1, createdAt: -1 });
+notificationSchema.index({ tenantId: 1, isRead: 1, isDeleted: 1 });
+
+const Notification = mongoose.model('Notification', notificationSchema);
+
+const fcmTokenSchema = new mongoose.Schema({
+    tenantId: { type: String, required: true, index: true },
+    userId: { type: String, default: null },
+    token: { type: String, required: true },
+    platform: { type: String, enum: ['android', 'ios', 'web'], required: true },
+    deviceId: { type: String, default: null },
+    deviceName: { type: String, default: null },
+    appVersion: { type: String, default: null },
+    isActive: { type: Boolean, default: true },
+    lastUsedAt: { type: Date, default: Date.now },
+}, { timestamps: true });
+
+fcmTokenSchema.index({ tenantId: 1, isActive: 1 });
+fcmTokenSchema.index({ token: 1 }, { unique: true });
+
+const FCMToken = mongoose.model('FCMToken', fcmTokenSchema);
+
+// ── Retry / Campaign Lifecycle / Notification Services ─────────────────────────
 const ConfigurationManager = require('./services/ConfigurationManager');
 const RetryScheduler = require('./services/RetryScheduler');
 const PhaseExecutor = require('./services/PhaseExecutor');
@@ -460,6 +501,8 @@ const CampaignExecutor = require('./services/CampaignExecutor');
 const MessageTracker = require('./services/MessageTracker');
 const ReportGenerator = require('./services/ReportGenerator');
 const SocketEmitter = require('./services/SocketEmitter');
+const FCMService = require('./services/FCMService');
+const NotificationService = require('./services/NotificationService');
 
 const configManager = new ConfigurationManager(RetryConfiguration);
 
@@ -1027,6 +1070,145 @@ app.post('/api/admin/regenerate-permanent-tokens', async (req, res) => {
     });
 });
 
+// ── NOTIFICATION REST API ENDPOINTS ───────────────────────────────────────────
+
+// 1. Register or update FCM Device Token
+app.post('/api/notifications/register-token', async (req, res) => {
+    const { tenantId, token, platform, deviceId, deviceName, appVersion } = req.body;
+    if (!tenantId || !token || !platform) {
+        return res.status(400).json({ error: 'tenantId, token, and platform are required' });
+    }
+
+    try {
+        const FCMToken = mongoose.model('FCMToken');
+        const updatedToken = await FCMToken.findOneAndUpdate(
+            { token },
+            {
+                tenantId,
+                token,
+                platform,
+                deviceId: deviceId || null,
+                deviceName: deviceName || null,
+                appVersion: appVersion || null,
+                isActive: true,
+                lastUsedAt: new Date()
+            },
+            { upsert: true, new: true }
+        );
+
+        // Subscribe device token to tenant FCM topic
+        await FCMService.subscribeToTenantTopic(token, tenantId);
+
+        res.json({ success: true, token: updatedToken });
+    } catch (err) {
+        console.error('[Notifications API] Error registering token:', err.message);
+        res.status(500).json({ error: 'Failed to register token' });
+    }
+});
+
+// 2. Get Notifications (Paginated)
+app.get('/api/notifications', async (req, res) => {
+    const tenantId = req.headers['tenant-id'] || req.query.tenantId;
+    if (!tenantId) return res.status(400).json({ error: 'tenantId is required' });
+
+    try {
+        const { page, limit, category, unreadOnly } = req.query;
+        const result = await NotificationService.getForTenant(tenantId, {
+            page: parseInt(page, 10) || 1,
+            limit: parseInt(limit, 10) || 20,
+            category: category || 'all',
+            unreadOnly: unreadOnly === 'true'
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('[Notifications API] Error fetching notifications:', err.message);
+        res.status(500).json({ error: 'Failed to fetch notifications' });
+    }
+});
+
+// 3. Get Unread Notification Count
+app.get('/api/notifications/count', async (req, res) => {
+    const tenantId = req.headers['tenant-id'] || req.query.tenantId;
+    if (!tenantId) return res.status(400).json({ error: 'tenantId is required' });
+
+    try {
+        const count = await NotificationService.getUnreadCount(tenantId);
+        res.json({ unreadCount: count });
+    } catch (err) {
+        console.error('[Notifications API] Error fetching unread count:', err.message);
+        res.status(500).json({ error: 'Failed to fetch unread count' });
+    }
+});
+
+// 4. Mark single notification as read
+app.patch('/api/notifications/:id/read', async (req, res) => {
+    const tenantId = req.headers['tenant-id'] || req.body.tenantId;
+    const notificationId = req.params.id;
+    if (!tenantId || !notificationId) {
+        return res.status(400).json({ error: 'tenantId and notificationId are required' });
+    }
+
+    try {
+        const result = await NotificationService.markRead(notificationId, tenantId);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[Notifications API] Error marking notification read:', err.message);
+        res.status(500).json({ error: 'Failed to mark notification read' });
+    }
+});
+
+// 5. Mark all notifications as read for tenant
+app.patch('/api/notifications/mark-all-read', async (req, res) => {
+    const tenantId = req.headers['tenant-id'] || req.body.tenantId;
+    if (!tenantId) return res.status(400).json({ error: 'tenantId is required' });
+
+    try {
+        const result = await NotificationService.markAllRead(tenantId);
+        res.json(result);
+    } catch (err) {
+        console.error('[Notifications API] Error marking all read:', err.message);
+        res.status(500).json({ error: 'Failed to mark all read' });
+    }
+});
+
+// 6. Delete notification (soft delete)
+app.delete('/api/notifications/:id', async (req, res) => {
+    const tenantId = req.headers['tenant-id'] || req.query.tenantId;
+    const notificationId = req.params.id;
+    if (!tenantId || !notificationId) {
+        return res.status(400).json({ error: 'tenantId and notificationId are required' });
+    }
+
+    try {
+        const result = await NotificationService.delete(notificationId, tenantId);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[Notifications API] Error deleting notification:', err.message);
+        res.status(500).json({ error: 'Failed to delete notification' });
+    }
+});
+
+// 7. Send Test Notification (for local development testing)
+app.post('/api/notifications/test', async (req, res) => {
+    const { tenantId, title, body, category } = req.body;
+    if (!tenantId) return res.status(400).json({ error: 'tenantId is required' });
+
+    try {
+        const notification = await NotificationService.create({
+            tenantId,
+            title: title || '🔔 Test Notification',
+            body: body || 'This is a test notification from local development server!',
+            type: 'system',
+            category: category || 'system',
+            actionData: { screen: 'test' }
+        });
+        res.json({ success: true, notification });
+    } catch (err) {
+        console.error('[Notifications API] Test notification error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 //  Register — validates only, does NOT save to DB. Returns a short-lived registration token.
 app.post('/register', async (req, res) => {
     const { name, email, password } = req.body;
@@ -1319,6 +1501,19 @@ app.post('/verify-panel-payment', authenticate, async (req, res) => {
             amount: plan.totalPrice,
             timestamp: now,
         });
+
+        // Trigger payment notification
+        try {
+            await NotificationService.create({
+                tenantId,
+                title: '💳 Payment Successful',
+                body: `${plan.name} plan activated! Your account is valid till ${panelExpiresAt.toLocaleDateString('en-IN')}`,
+                type: 'payment_success',
+                category: 'payment',
+                actionData: { screen: 'payments' }
+            });
+        } catch (_) { }
+
         res.json({ success: true, panelExpiresAt });
     } catch (error) {
         res.status(500).json({ error: 'Panel payment verification failed', details: error.message });
@@ -3565,18 +3760,45 @@ app.post('/api/whatsapp/register-phone', authenticate, async (req, res) => {
         const result = await registerPhoneNumber(phoneNumberId, accessToken, pin);
 
         if (result.success) {
+            // After successful registration, fetch fresh phone metadata from Meta
+            // so quality_rating, status, display_phone_number and verified_name are
+            // persisted immediately and the dashboard badge stops showing UNKNOWN.
+            const metaFields = {};
+            try {
+                const apiVersion = process.env.META_API_VERSION || 'v25.0';
+                const phoneRes = await axios.get(
+                    `https://graph.facebook.com/${apiVersion}/${phoneNumberId}`,
+                    {
+                        params: {
+                            fields: 'quality_rating,display_phone_number,verified_name,code_verification_status,throughput',
+                            access_token: accessToken,
+                        },
+                    }
+                );
+                const pd = phoneRes.data || {};
+                if (pd.quality_rating)       metaFields['whatsappConfig.qualityRating']   = pd.quality_rating;
+                if (pd.display_phone_number) metaFields['whatsappConfig.displayPhone']    = pd.display_phone_number;
+                if (pd.verified_name)        metaFields['whatsappConfig.verifiedName']    = pd.verified_name;
+                if (pd.throughput?.level)    metaFields['whatsappConfig.throughputLevel'] = pd.throughput.level;
+                console.log(`[POST /api/whatsapp/register-phone] ✅ Fetched Meta phone metadata:`, pd);
+            } catch (metaErr) {
+                console.warn(`[POST /api/whatsapp/register-phone] ⚠️  Could not fetch phone metadata from Meta after registration:`, metaErr.response?.data || metaErr.message);
+            }
+
             await Tenant.findByIdAndUpdate(tenantId, {
                 $set: {
                     'whatsappConfig.phoneStatus': 'CONNECTED',
                     'whatsappConfig.verified': true,
                     'whatsappConfig.registrationPin': pin,
                     'whatsappConfig.registrationError': null,
+                    ...metaFields,
                 }
             });
             return res.json({
                 success: true,
                 message: 'Phone number registered successfully with Meta Cloud API!',
                 data: result.data,
+                qualityRating: metaFields['whatsappConfig.qualityRating'] || null,
             });
         } else {
             await Tenant.findByIdAndUpdate(tenantId, {
@@ -5671,6 +5893,20 @@ async function handleLiveChat(tenantId, message, profileName, from) {
     });
     await broadcastConversations(tenantId);
     await broadcastMessages(tenantId, from);
+
+    // Trigger Notification for incoming WhatsApp message
+    try {
+        await NotificationService.create({
+            tenantId,
+            title: `💬 ${profileName || from}`,
+            body: lastMessagePreview || 'Sent you a message',
+            type: 'chat_message',
+            category: 'chat',
+            actionData: { contactId: from, screen: 'chats' }
+        });
+    } catch (notifErr) {
+        console.error('[Webhook] Failed to create chat notification:', notifErr.message);
+    }
 }
 
 //  Incoming Webhook (Messages & Status Updates) 
@@ -5753,6 +5989,23 @@ app.post('/webhook', async (req, res) => {
                             language: lang
                         });
                         console.log(`[Webhook] Emitted template_status_update to tenant ${tenantId}`);
+
+                        // Trigger In-App & FCM Push Notification
+                        try {
+                            const isApproved = eventStatus === 'APPROVED';
+                            await NotificationService.create({
+                                tenantId,
+                                title: isApproved ? '✅ Template Approved' : '❌ Template Rejected',
+                                body: isApproved 
+                                    ? `Template "${templateName}" was approved by Meta!`
+                                    : `Template "${templateName}" was rejected by Meta. Reason: ${reason || 'Policy violation'}`,
+                                type: 'system',
+                                category: 'system',
+                                actionData: { screen: 'templates' }
+                            });
+                        } catch (notifErr) {
+                            console.error('[Webhook] Failed to create template status notification:', notifErr.message);
+                        }
                     } else {
                         console.warn(`[Webhook] Received template status update for WABA ${wabaId} but no tenant found.`);
                     }

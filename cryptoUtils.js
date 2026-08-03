@@ -41,6 +41,7 @@ function encryptSecret(plaintext) {
  * @param {string} stored "ivHex:encryptedHex"
  * @returns {string} plaintext
  */
+
 function decryptSecret(stored) {
   if (!stored || !stored.includes(':')) {
     // Legacy plain-text secret — return as-is

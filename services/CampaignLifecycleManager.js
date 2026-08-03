@@ -313,6 +313,19 @@ class CampaignLifecycleManager {
             phases: []
         });
 
+        // Trigger Notification
+        try {
+            const NotificationService = require('./NotificationService');
+            await NotificationService.create({
+                tenantId,
+                title: '✅ Campaign Completed',
+                body: `Campaign completed: ${finalStats.totalSuccess} delivered, ${finalStats.totalFailure} failed.`,
+                type: 'campaign_completed',
+                category: 'campaign',
+                actionData: { screen: 'campaign_detail', campaignId }
+            });
+        } catch (_) { }
+
         return finalStats;
     }
 
