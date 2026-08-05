@@ -667,9 +667,23 @@ process.on('uncaughtException', (err) => console.error(' Uncaught Exception:', e
 
 //  App Setup 
 const app = express();
-app.use(cors());
+
+// Enable CORS for web clients (https://app.sendzyy.com, etc.) including preflight OPTIONS requests
+const corsOptions = {
+    origin: function (origin, callback) {
+        // Allow all origins (including app.sendzyy.com) with credentials
+        callback(null, true);
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+    credentials: true,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
 const httpServer = http.createServer(app);
-const io = new Server(httpServer, { cors: { origin: '*' } });
+const io = new Server(httpServer, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 SocketEmitter.setIo(io);
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.raw({
@@ -6341,17 +6355,25 @@ async function broadcastCampaigns(tenantId) {
 async function runScheduledCampaigns() {
     try {
         const now = new Date();
-        const due = await ScheduledCampaign.find({ status: 'pending', scheduledAt: { $lte: now } });
+        const fiveMinsAgo = new Date(Date.now() - 5 * 60 * 1000);
+        // Pick up pending due campaigns AND stalled running campaigns (no update in 5 mins due to server restart/crash)
+        const due = await ScheduledCampaign.find({
+            $or: [
+                { status: 'pending', scheduledAt: { $lte: now } },
+                { status: 'running', updatedAt: { $lt: fiveMinsAgo } }
+            ]
+        });
+
         for (const sc of due) {
-            await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'running' } });
+            await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'running', updatedAt: new Date() } });
             const tenant = await Tenant.findById(sc.tenantId);
             if (!tenant) {
-                await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'failed', errorMessage: 'Tenant not found' } });
+                await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'failed', errorMessage: 'Tenant not found', updatedAt: new Date() } });
                 continue;
             }
             const config = tenant.whatsappConfig;
             if (!config?.accessToken || !config?.phoneNumberId) {
-                await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'failed', errorMessage: 'WhatsApp not configured' } });
+                await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'failed', errorMessage: 'WhatsApp not configured', updatedAt: new Date() } });
                 continue;
             }
             const campaignId = `sched_${sc._id}`;
@@ -6380,99 +6402,132 @@ async function runScheduledCampaigns() {
                 console.error(`[ScheduledCampaign] Failed to fetch template components: ${err.message}`);
             }
 
-            // Create initial Campaign document so it appears in reporting immediately
-            await Campaign.create({
-                tenantId: sc.tenantId,
-                id: campaignId,
-                template: sc.template,
-                timestamp: sc.scheduledAt || new Date(),
-                dispatchedAt: new Date(),
-                totalCount: sc.recipients.length,
-                successCount: 0,
-                failureCount: 0,
-                ...lifecycleFields
+            // Ensure initial Campaign document exists
+            let campaignDoc = await Campaign.findOne({ id: campaignId, tenantId: sc.tenantId });
+            if (!campaignDoc) {
+                await Campaign.create({
+                    tenantId: sc.tenantId,
+                    id: campaignId,
+                    template: sc.template,
+                    timestamp: sc.scheduledAt || new Date(),
+                    dispatchedAt: new Date(),
+                    totalCount: sc.recipients.length,
+                    successCount: 0,
+                    failureCount: 0,
+                    ...lifecycleFields
+                });
+            }
+
+            // Check existing Recipient records for resumption/deduplication
+            const existingRecipients = await Recipient.find({ campaignId, tenantId: sc.tenantId }).select('to status').lean();
+            const processedNumbers = new Set(existingRecipients.map(r => r.to));
+            let success = existingRecipients.filter(r => r.status === 'sent' || r.status === 'delivered' || r.status === 'read').length;
+            let failure = existingRecipients.filter(r => r.status === 'failed').length;
+
+            const remainingRecipients = sc.recipients.filter(r => {
+                const to = r.mobileNumber || r.to;
+                return to && !processedNumbers.has(to);
             });
 
-            let success = 0, failure = 0;
-            for (const recipient of sc.recipients) {
-                const to = recipient.mobileNumber || recipient.to;
-                if (!to) {
-                    failure++;
-                    continue;
-                }
-                try {
-                    const components = [];
-                    if (sc.mediaId && sc.mediaType) {
-                        components.push({ type: 'header', parameters: [{ type: sc.mediaType.toLowerCase(), [sc.mediaType.toLowerCase()]: { id: sc.mediaId } }] });
+            console.log(`[ScheduledCampaign] Starting/Resuming ${sc._id}: ${processedNumbers.size} already processed, ${remainingRecipients.length} remaining.`);
+
+            // Process remaining recipients in batches of 10 concurrent requests for maximum speed
+            const BATCH_SIZE = 10;
+            for (let i = 0; i < remainingRecipients.length; i += BATCH_SIZE) {
+                const chunk = remainingRecipients.slice(i, i + BATCH_SIZE);
+                await Promise.all(chunk.map(async (recipient) => {
+                    const to = recipient.mobileNumber || recipient.to;
+                    if (!to) {
+                        failure++;
+                        return;
                     }
-                    const vars = recipient.variables || {};
-                    const bodyParams = Object.keys(vars).sort().map(k => ({ type: 'text', text: vars[k] }));
-                    if (bodyParams.length) components.push({ type: 'body', parameters: bodyParams });
-                    const payload = {
-                        messaging_product: 'whatsapp', to, type: 'template',
-                        template: { name: sc.template, language: { code: sc.language || 'en_US' }, ...(components.length ? { components } : {}) }
-                    };
-                    const resp = await axios.post(`${WHATSAPP_API_URL}/${config.phoneNumberId}/messages`, payload, {
-                        headers: { Authorization: `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' }
-                    });
-                    const wamid = resp.data?.messages?.[0]?.id;
-                    if (wamid) {
-                        success++;
-                        // Persist Recipient document
-                        await Recipient.create({
-                            tenantId: sc.tenantId,
-                            campaignId,
-                            wamid,
-                            to,
-                            status: 'sent',
-                            sentAt: new Date().toISOString(),
-                            phaseNumber: null,
-                            retryHistory: []
+                    try {
+                        const components = [];
+                        if (sc.mediaId && sc.mediaType) {
+                            components.push({ type: 'header', parameters: [{ type: sc.mediaType.toLowerCase(), [sc.mediaType.toLowerCase()]: { id: sc.mediaId } }] });
+                        } else if (recipient.headerVariables && typeof recipient.headerVariables === 'object') {
+                            const headerVars = recipient.headerVariables;
+                            const sortedHeaderKeys = Object.keys(headerVars).sort((a, b) => Number(a) - Number(b));
+                            const headerParams = sortedHeaderKeys.map(k => ({ type: 'text', text: String(headerVars[k]) }));
+                            if (headerParams.length) components.push({ type: 'header', parameters: headerParams });
+                        }
+
+                        const vars = recipient.variables || {};
+                        const bodyParams = Object.keys(vars).sort((a, b) => Number(a) - Number(b)).map(k => ({ type: 'text', text: String(vars[k]) }));
+                        if (bodyParams.length) components.push({ type: 'body', parameters: bodyParams });
+
+                        const payload = {
+                            messaging_product: 'whatsapp', to, type: 'template',
+                            template: { name: sc.template, language: { code: sc.language || 'en_US' }, ...(components.length ? { components } : {}) }
+                        };
+                        const resp = await axios.post(`${WHATSAPP_API_URL}/${config.phoneNumberId}/messages`, payload, {
+                            headers: { Authorization: `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' }
                         });
-                        // Persist StatusMapping for webhook delivery tracking
-                        await StatusMapping.findOneAndUpdate(
-                            { wamid },
-                            { wamid, tenantId: sc.tenantId, campaignId, to },
-                            { upsert: true }
-                        );
-
-                        // Log outbound template message so it appears in the conversation/chat screen
-                        try {
-                            const previewText = buildPreview('template', {
-                                templateName: sc.template,
-                                templateBody: templateBodyText,
+                        const wamid = resp.data?.messages?.[0]?.id;
+                        if (wamid) {
+                            success++;
+                            await Recipient.create({
+                                tenantId: sc.tenantId,
+                                campaignId,
+                                wamid,
+                                to,
+                                status: 'sent',
+                                sentAt: new Date().toISOString(),
+                                phaseNumber: null,
+                                retryHistory: []
                             });
-
-                            await Conversation.findOneAndUpdate(
-                                { tenantId: sc.tenantId, contactId: to },
-                                {
-                                    name: to,
-                                    lastMessage: previewText,
-                                    lastActive: new Date(),
-                                    $setOnInsert: { hasReply: false }
-                                },
+                            await StatusMapping.findOneAndUpdate(
+                                { wamid },
+                                { wamid, tenantId: sc.tenantId, campaignId, to },
                                 { upsert: true }
                             );
 
-                            await Message.create({
-                                tenantId: sc.tenantId,
-                                contactId: to,
-                                text: templateBodyText || `📋 Template: ${sc.template}`,
-                                isMe: true,
-                                time: new Date().toISOString(),
-                                messageType: 'template',
-                                templateName: sc.template,
-                                templateBody: templateBodyText,
-                                wamid: wamid,
-                                status: 'sent',
-                            });
+                            try {
+                                const previewText = buildPreview('template', {
+                                    templateName: sc.template,
+                                    templateBody: templateBodyText,
+                                });
 
-                            await broadcastConversations(sc.tenantId);
-                            await broadcastMessages(sc.tenantId, to);
-                        } catch (msgErr) {
-                            console.error(`[ScheduledCampaign] Failed to create Message/Conversation log for ${to}:`, msgErr.message);
+                                await Conversation.findOneAndUpdate(
+                                    { tenantId: sc.tenantId, contactId: to },
+                                    {
+                                        name: to,
+                                        lastMessage: previewText,
+                                        lastActive: new Date(),
+                                        $setOnInsert: { hasReply: false }
+                                    },
+                                    { upsert: true }
+                                );
+
+                                await Message.create({
+                                    tenantId: sc.tenantId,
+                                    contactId: to,
+                                    text: templateBodyText || `📋 Template: ${sc.template}`,
+                                    isMe: true,
+                                    time: new Date().toISOString(),
+                                    messageType: 'template',
+                                    templateName: sc.template,
+                                    templateBody: templateBodyText,
+                                    wamid: wamid,
+                                    status: 'sent',
+                                });
+                            } catch (msgErr) {
+                                console.error(`[ScheduledCampaign] Failed to create Message/Conversation log for ${to}:`, msgErr.message);
+                            }
+                        } else {
+                            failure++;
+                            await Recipient.create({
+                                tenantId: sc.tenantId,
+                                campaignId,
+                                wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                                to,
+                                status: 'failed',
+                                failedAt: new Date().toISOString(),
+                                phaseNumber: null,
+                                retryHistory: []
+                            });
                         }
-                    } else {
+                    } catch (sendErr) {
                         failure++;
                         await Recipient.create({
                             tenantId: sc.tenantId,
@@ -6485,36 +6540,27 @@ async function runScheduledCampaigns() {
                             retryHistory: []
                         });
                     }
-                } catch (sendErr) {
-                    failure++;
-                    await Recipient.create({
-                        tenantId: sc.tenantId,
-                        campaignId,
-                        wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-                        to,
-                        status: 'failed',
-                        failedAt: new Date().toISOString(),
-                        phaseNumber: null,
-                        retryHistory: []
-                    });
-                }
+                }));
+
+                // Periodically update DB progress & timestamp so stalled recovery won't re-trigger and dashboard updates live
+                await ScheduledCampaign.updateOne(
+                    { _id: sc._id },
+                    { $set: { updatedAt: new Date(), successCount: success, failureCount: failure } }
+                );
+                await Campaign.updateOne(
+                    { id: campaignId },
+                    { $set: { successCount: success, failureCount: failure } }
+                );
+                await broadcastCampaigns(sc.tenantId);
             }
 
             // Update Campaign final counts
             await Campaign.updateOne(
                 { id: campaignId },
-                {
-                    $set: {
-                        successCount: success,
-                        failureCount: failure
-                    }
-                }
+                { $set: { successCount: success, failureCount: failure } }
             );
 
             // ── Trigger retry system (mirrors normal campaign behaviour) ────────────
-            // Schedule phase 1 (grace-period evaluation) so the RetryScheduler cron
-            // can pick up failed/undelivered messages after the configured interval.
-            // Returns null (no-op) when the campaign has zero retry phases configured.
             try {
                 const scheduledPhase = await retryScheduler.schedulePhase(
                     campaignId,
@@ -6540,7 +6586,6 @@ async function runScheduledCampaigns() {
                     }));
                 }
             } catch (retryErr) {
-                // Non-fatal: log the error but do not prevent the scheduled job from completing
                 console.error(JSON.stringify({
                     service: 'ScheduledCampaign',
                     event: 'retry_phase1_schedule_error',
@@ -6551,10 +6596,8 @@ async function runScheduledCampaigns() {
                 }));
             }
 
-            // Emit progress updates to active dashboard rooms
             await broadcastCampaigns(sc.tenantId);
-
-            await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'completed', resultCampaignId: campaignId, successCount: success, failureCount: failure } });
+            await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'completed', resultCampaignId: campaignId, successCount: success, failureCount: failure, updatedAt: new Date() } });
             console.log(` Scheduled campaign ${sc._id} completed: ${success} sent, ${failure} failed`);
         }
     } catch (err) {
@@ -6562,6 +6605,7 @@ async function runScheduledCampaigns() {
     }
 }
 setInterval(runScheduledCampaigns, 60 * 1000);
+
 
 // ── Lead Trigger CRUD Routes ──────────────────────────────────────────────────────
 
