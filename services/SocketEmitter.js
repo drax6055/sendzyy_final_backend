@@ -207,6 +207,7 @@ const SocketEmitter = {
             event: 'campaign:completed',
             tenantId,
             campaignId,
+            
             totalSuccess: finalStats.totalSuccess,
             totalFailure: finalStats.totalFailure,
             overallSuccessRate: finalStats.overallSuccessRate,
