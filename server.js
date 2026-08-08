@@ -7579,7 +7579,7 @@ app.put('/api/tenant/openai-key', authenticate, async (req, res) => {
 
 // POST /api/ai/generate-template (authenticated)
 app.post('/api/ai/generate-template', authenticate, async (req, res) => {
-    const { prompt } = req.body;
+    const { prompt, category } = req.body;
 
     // Validate prompt
     if (!prompt || typeof prompt !== 'string' || prompt.trim() === '') {
@@ -7602,16 +7602,37 @@ app.post('/api/ai/generate-template', authenticate, async (req, res) => {
         return res.status(500).json({ error: 'Internal server error' });
     }
 
-    // Call OpenAI Chat Completions API
-    const systemPrompt = `You are a WhatsApp Business template content generator.
-Your task is to produce template content based on the user's description.
-Follow WhatsApp template content policies strictly:
-- No URLs, phone numbers, or email addresses in the body unless they are template variables.
-- No promotional language in UTILITY templates.
-- Keep the message professional and clear.
-- The header must be plain text only (no media), 60 characters or fewer.
-- The footer must be 60 characters or fewer.
+    // Build category-specific rule
+    let categoryRule = '';
+    if (category === 'UTILITY') {
+        categoryRule = `4. Category Rule (UTILITY):
+   - The message MUST be strictly transactional, informational, and direct (e.g., appointment updates, order tracking, receipts, alerts).
+   - Meta policy strictly FORBIDS promotional/sales language, discount offers, or upselling in Utility templates.`;
+    } else if (category === 'MARKETING') {
+        categoryRule = `4. Category Rule (MARKETING):
+   - The message should be engaging, promotional, and persuasive (e.g., announcements, sales, offers, product launches).
+   - Feel free to include special offers, clear calls to action, brand enthusiasm, and relevant emojis while remaining professional.`;
+    }
 
+    // Call OpenAI Chat Completions API
+    const systemPrompt = `You are an expert WhatsApp Business Meta API template content generator.
+Your task is to produce compliant WhatsApp template content based on the user's description.
+
+STRICT META COMPLIANCE RULES:
+1. Variable Rules:
+   - Preserve all variables like {{1}}, {{2}}, {{3}} exactly as given in the input. Do not remove, rename, renumber, or alter variables.
+   - All variables MUST use sequential numeric format like {{1}}, {{2}}, {{3}} (never use named variables like {{name}} or non-sequential numbers).
+   - Do NOT place variables in the Header or Footer text. Variables belong ONLY in the Body.
+   - Do NOT start or end the body text directly with a variable. Ensure natural text surrounds variables.
+2. Character Limits:
+   - Body: maximum 1024 characters.
+   - Header (optional): plain text only, maximum 60 characters.
+   - Footer (optional): plain text only, maximum 60 characters.
+3. Content & Formatting:
+   - Use WhatsApp formatting where appropriate (*bold*, _italics_).
+   - Avoid ALL CAPS spammy words or excessive punctuation (e.g. "BUY NOW!!!").
+   - No hardcoded URLs, phone numbers, or email addresses in plain text.
+${categoryRule ? `${categoryRule}\n` : ''}
 Respond with ONLY a valid JSON object in this exact format (no markdown, no extra text):
 {
   "body": "<required: the main message body>",
