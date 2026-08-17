@@ -252,6 +252,7 @@ const recipientSchema = new mongoose.Schema({
     campaignId: String,
     wamid: { type: String, unique: true },
     to: String,
+    name: { type: String, default: null },   // client name captured at send time
     status: { type: String, default: 'sent' },
     sentAt: String,
     deliveredAt: String,
@@ -730,7 +731,7 @@ const corsOptions = {
         callback(null, true);
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'tenant-id'],
     credentials: true,
 };
 
@@ -1320,6 +1321,7 @@ app.post('/create-panel-order-register', async (req, res) => {
             amount: plan.totalPrice * 100,
             currency: 'INR',
             receipt: `reg_${Date.now()}`,
+            payment_capture: 1, // Auto-capture: no manual capture needed on Razorpay dashboard
             notes: { email: regData.email, panelDays: plan.panelDays, planId: plan.id }
         });
         res.json({ ...order, panelDays: plan.panelDays, price: plan.totalPrice, planId: plan.id });
@@ -1480,6 +1482,7 @@ app.post('/create-panel-order', authenticate, async (req, res) => {
             amount: plan.totalPrice * 100,
             currency: 'INR',
             receipt: `panel_${Date.now()}`,
+            payment_capture: 1, // Auto-capture: no manual capture needed on Razorpay dashboard
             notes: { tenantId: req.user.tenantId, panelDays: plan.panelDays, planId: plan.id }
         });
         res.json({ ...order, panelDays: plan.panelDays, price: plan.totalPrice, planId: plan.id });
@@ -1503,6 +1506,7 @@ app.post('/create-panel-order-renew', async (req, res) => {
             amount: plan.totalPrice * 100,
             currency: 'INR',
             receipt: `renew_${Date.now()}`,
+            payment_capture: 1, // Auto-capture: no manual capture needed on Razorpay dashboard
             notes: { tenantId: tenant._id.toString(), panelDays: plan.panelDays, planId: plan.id }
         });
         res.json({ ...order, panelDays: plan.panelDays, price: plan.totalPrice, planId: plan.id });
@@ -2618,7 +2622,7 @@ app.delete('/api/chatbots/:id', authenticate, async (req, res) => {
 
 //  Send Message 
 app.post('/send-message', authenticate, async (req, res) => {
-    const { to, type, template, text, mediaId, mediaType, campaignId } = req.body;
+    const { to, type, template, text, mediaId, mediaType, campaignId, recipientName } = req.body;
     const tenantId = req.user.tenantId;
     try {
         const tenant = await Tenant.findById(tenantId);
@@ -2716,6 +2720,7 @@ app.post('/send-message', authenticate, async (req, res) => {
                         tenantId,
                         campaignId,
                         to,
+                        ...(recipientName ? { name: recipientName } : {}),
                         status: 'sent',
                         sentAt: new Date().toISOString(),
                         phaseNumber: null,
@@ -2797,7 +2802,8 @@ app.post('/send-message', authenticate, async (req, res) => {
         res.json({ success: true, wamid });
     } catch (error) {
         console.error(' Send Message Error:', error.response?.data || error.message);
-        res.status(500).json({ error: 'Failed to send message' });
+        const detailedError = error.response?.data?.error?.message || error.response?.data?.error || error.message || 'Failed to send message';
+        res.status(error.response?.status || 500).json({ error: detailedError });
     }
 });
 
@@ -6598,6 +6604,7 @@ async function runScheduledCampaigns() {
                                 campaignId,
                                 wamid,
                                 to,
+                                name: recipient.name || null,
                                 status: 'sent',
                                 sentAt: new Date().toISOString(),
                                 phaseNumber: null,
@@ -6648,6 +6655,7 @@ async function runScheduledCampaigns() {
                                 campaignId,
                                 wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
                                 to,
+                                name: recipient.name || null,
                                 status: 'failed',
                                 failedAt: new Date().toISOString(),
                                 phaseNumber: null,
@@ -6661,6 +6669,7 @@ async function runScheduledCampaigns() {
                             campaignId,
                             wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
                             to,
+                            name: recipient.name || null,
                             status: 'failed',
                             failedAt: new Date().toISOString(),
                             phaseNumber: null,
@@ -8191,6 +8200,7 @@ app.post('/api/superadmin/tenants/create-payment-invite', authenticateSuperAdmin
             amount: plan.totalPrice * 100,
             currency: 'INR',
             receipt: `invite_${Date.now()}`,
+            payment_capture: 1, // Auto-capture: no manual capture needed on Razorpay dashboard
             notes: { email: email.toLowerCase().trim(), name: name.trim(), planId: plan.id, source: 'superadmin_invite' },
         });
 
@@ -8488,7 +8498,7 @@ app.put('/api/superadmin/packages/:id', authenticateSuperAdmin, async (req, res)
 });
 
 // ── DELETE /api/superadmin/packages/:id ──────────────────────────────────────
-// Soft-deletes (deactivates) a package. Guards against deletion if active tenants use it.
+// Hard-deletes a package from DB. Guards against deletion if active tenants use it.
 app.delete('/api/superadmin/packages/:id', authenticateSuperAdmin, async (req, res) => {
     try {
         const pkg = await PanelPackage.findById(req.params.id);
@@ -8502,28 +8512,26 @@ app.delete('/api/superadmin/packages/:id', authenticateSuperAdmin, async (req, r
 
         if (activeTenantCount > 0) {
             return res.status(409).json({
-                error: `Cannot deactivate package. ${activeTenantCount} active tenant(s) are currently on this plan.`,
+                error: `Cannot delete package. ${activeTenantCount} active tenant(s) are currently on this plan.`,
                 activeTenantCount,
             });
         }
 
-        // Soft delete
-        pkg.isActive = false;
-        await pkg.save();
+        // Hard delete — permanently removes the document from MongoDB
+        await PanelPackage.findByIdAndDelete(req.params.id);
 
         res.json({
             success: true,
-            message: `Package '${pkg.name}' deactivated successfully.`,
+            message: `Package '${pkg.name}' deleted permanently.`,
             package: {
                 id: pkg._id.toString(),
                 planId: pkg.planId,
                 name: pkg.name,
-                isActive: pkg.isActive,
             },
         });
     } catch (err) {
         console.error('[SuperAdmin] DELETE packages error:', err.message);
-        res.status(500).json({ error: 'Failed to deactivate package', details: err.message });
+        res.status(500).json({ error: 'Failed to delete package', details: err.message });
     }
 });
 
