@@ -115,6 +115,9 @@ class CampaignExecutor {
         const BATCH_SIZE = 10;
         for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
             const chunk = recipients.slice(i, i + BATCH_SIZE);
+            const recipientDocs = [];
+            const statusMappingOps = [];
+
             await Promise.all(chunk.map(async (recipient) => {
                 const to = recipient.mobileNumber || recipient.to;
                 if (!to) {
@@ -145,8 +148,8 @@ class CampaignExecutor {
 
                     const sentAt = new Date().toISOString();
 
-                    // Persist Recipient document
-                    await this.Recipient.create({
+                    // Queue Recipient document for bulk insert
+                    recipientDocs.push({
                         tenantId,
                         campaignId,
                         wamid,
@@ -157,14 +160,17 @@ class CampaignExecutor {
                         retryHistory: []
                     });
 
-                    // Persist wamid → campaign mapping for delivery webhooks
-                    await this.StatusMapping.findOneAndUpdate(
-                        { wamid },
-                        { wamid, tenantId, campaignId, to },
-                        { upsert: true }
-                    );
+                    // Queue StatusMapping for bulk write
+                    statusMappingOps.push({
+                        updateOne: {
+                            filter: { wamid },
+                            update: { $set: { wamid, tenantId, campaignId, to } },
+                            upsert: true
+                        }
+                    });
 
                     successCount++;
+                    sentCount++;
 
                     console.log(JSON.stringify({
                         service: 'CampaignExecutor',
@@ -176,6 +182,7 @@ class CampaignExecutor {
                     }));
                 } catch (sendErr) {
                     failureCount++;
+                    sentCount++;
 
                     console.error(JSON.stringify({
                         service: 'CampaignExecutor',
@@ -187,32 +194,29 @@ class CampaignExecutor {
                         timestamp: new Date().toISOString()
                     }));
 
-                    // Still create a failed Recipient document for retry tracking
-                    try {
-                        await this.Recipient.create({
-                            tenantId,
-                            campaignId,
-                            wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-                            to,
-                            status: 'failed',
-                            failedAt: new Date().toISOString(),
-                            phaseNumber: null,
-                            retryHistory: []
-                        });
-                    } catch (dbErr) {
-                        console.error(JSON.stringify({
-                            service: 'CampaignExecutor',
-                            event: 'recipient_create_error',
-                            campaignId,
-                            to,
-                            error: dbErr.message,
-                            timestamp: new Date().toISOString()
-                        }));
-                    }
+                    // Queue failed Recipient document for bulk insert
+                    recipientDocs.push({
+                        tenantId,
+                        campaignId,
+                        wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                        to,
+                        status: 'failed',
+                        failedAt: new Date().toISOString(),
+                        phaseNumber: null,
+                        retryHistory: []
+                    });
                 }
-
-                sentCount++;
             }));
+
+            // Execute batched DB writes for maximum throughput
+            const dbPromises = [];
+            if (recipientDocs.length > 0) {
+                dbPromises.push(this.Recipient.insertMany(recipientDocs, { ordered: false }).catch(err => console.error('[CampaignExecutor] Bulk Recipient insert error:', err.message)));
+            }
+            if (statusMappingOps.length > 0) {
+                dbPromises.push(this.StatusMapping.bulkWrite(statusMappingOps, { ordered: false }).catch(err => console.error('[CampaignExecutor] Bulk StatusMapping write error:', err.message)));
+            }
+            await Promise.all(dbPromises);
 
             // Emit progress after each batch
             this.socketEmitter.emitCampaignProgress(tenantId, campaignId, {

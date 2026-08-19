@@ -1,7 +1,6 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-setInterval(() => { }, 100000);
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const axios = require('axios');
@@ -268,6 +267,7 @@ const recipientSchema = new mongoose.Schema({
 });
 recipientSchema.index({ campaignId: 1, phaseNumber: 1 });
 recipientSchema.index({ campaignId: 1, status: 1 });
+recipientSchema.index({ campaignId: 1, phaseNumber: 1, status: 1, 'retryHistory.phaseNumber': 1 });
 const Recipient = mongoose.model('Recipient', recipientSchema);
 
 const retryConfigurationSchema = new mongoose.Schema({
@@ -6564,10 +6564,15 @@ async function runScheduledCampaigns() {
 
             console.log(`[ScheduledCampaign] Starting/Resuming ${sc._id}: ${processedNumbers.size} already processed, ${remainingRecipients.length} remaining.`);
 
-            // Process remaining recipients in batches of 10 concurrent requests for maximum speed
+            // Process remaining recipients in batches of 10 concurrent HTTP requests with bulk DB writes
             const BATCH_SIZE = 10;
             for (let i = 0; i < remainingRecipients.length; i += BATCH_SIZE) {
                 const chunk = remainingRecipients.slice(i, i + BATCH_SIZE);
+                const recipientDocs = [];
+                const statusMappingOps = [];
+                const conversationOps = [];
+                const messageDocs = [];
+
                 await Promise.all(chunk.map(async (recipient) => {
                     const to = recipient.mobileNumber || recipient.to;
                     if (!to) {
@@ -6599,7 +6604,7 @@ async function runScheduledCampaigns() {
                         const wamid = resp.data?.messages?.[0]?.id;
                         if (wamid) {
                             success++;
-                            await Recipient.create({
+                            recipientDocs.push({
                                 tenantId: sc.tenantId,
                                 campaignId,
                                 wamid,
@@ -6610,11 +6615,13 @@ async function runScheduledCampaigns() {
                                 phaseNumber: null,
                                 retryHistory: []
                             });
-                            await StatusMapping.findOneAndUpdate(
-                                { wamid },
-                                { wamid, tenantId: sc.tenantId, campaignId, to },
-                                { upsert: true }
-                            );
+                            statusMappingOps.push({
+                                updateOne: {
+                                    filter: { wamid },
+                                    update: { $set: { wamid, tenantId: sc.tenantId, campaignId, to } },
+                                    upsert: true
+                                }
+                            });
 
                             try {
                                 const previewText = buildPreview('template', {
@@ -6622,18 +6629,18 @@ async function runScheduledCampaigns() {
                                     templateBody: templateBodyText,
                                 });
 
-                                await Conversation.findOneAndUpdate(
-                                    { tenantId: sc.tenantId, contactId: to },
-                                    {
-                                        name: to,
-                                        lastMessage: previewText,
-                                        lastActive: new Date(),
-                                        $setOnInsert: { hasReply: false }
-                                    },
-                                    { upsert: true }
-                                );
+                                conversationOps.push({
+                                    updateOne: {
+                                        filter: { tenantId: sc.tenantId, contactId: to },
+                                        update: {
+                                            $set: { name: to, lastMessage: previewText, lastActive: new Date() },
+                                            $setOnInsert: { hasReply: false }
+                                        },
+                                        upsert: true
+                                    }
+                                });
 
-                                await Message.create({
+                                messageDocs.push({
                                     tenantId: sc.tenantId,
                                     contactId: to,
                                     text: templateBodyText || `📋 Template: ${sc.template}`,
@@ -6646,11 +6653,11 @@ async function runScheduledCampaigns() {
                                     status: 'sent',
                                 });
                             } catch (msgErr) {
-                                console.error(`[ScheduledCampaign] Failed to create Message/Conversation log for ${to}:`, msgErr.message);
+                                console.error(`[ScheduledCampaign] Failed to prepare Message/Conversation log for ${to}:`, msgErr.message);
                             }
                         } else {
                             failure++;
-                            await Recipient.create({
+                            recipientDocs.push({
                                 tenantId: sc.tenantId,
                                 campaignId,
                                 wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -6664,7 +6671,7 @@ async function runScheduledCampaigns() {
                         }
                     } catch (sendErr) {
                         failure++;
-                        await Recipient.create({
+                        recipientDocs.push({
                             tenantId: sc.tenantId,
                             campaignId,
                             wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -6677,6 +6684,14 @@ async function runScheduledCampaigns() {
                         });
                     }
                 }));
+
+                // Execute bulk database operations for maximum throughput
+                const dbPromises = [];
+                if (recipientDocs.length > 0) dbPromises.push(Recipient.insertMany(recipientDocs, { ordered: false }).catch(err => console.error('[ScheduledCampaign] Bulk Recipient insert error:', err.message)));
+                if (statusMappingOps.length > 0) dbPromises.push(StatusMapping.bulkWrite(statusMappingOps, { ordered: false }).catch(err => console.error('[ScheduledCampaign] Bulk StatusMapping write error:', err.message)));
+                if (conversationOps.length > 0) dbPromises.push(Conversation.bulkWrite(conversationOps, { ordered: false }).catch(err => console.error('[ScheduledCampaign] Bulk Conversation write error:', err.message)));
+                if (messageDocs.length > 0) dbPromises.push(Message.insertMany(messageDocs, { ordered: false }).catch(err => console.error('[ScheduledCampaign] Bulk Message insert error:', err.message)));
+                await Promise.all(dbPromises);
 
                 // Periodically update DB progress & timestamp so stalled recovery won't re-trigger and dashboard updates live
                 await ScheduledCampaign.updateOne(

@@ -176,35 +176,22 @@ class RetryScheduler {
 
         let cancelledCount = 0;
 
-        for (const phase of stalePhases) {
-            let reason = null;
+        // Batch lookup campaign status for all stale phases at once
+        const campaignIds = [...new Set(stalePhases.map(p => p.campaignId))];
+        const campaigns = await this.Campaign.find({ id: { $in: campaignIds } }).select('id status').lean();
+        const activeCampaignIds = new Set(campaigns.filter(c => c.status !== 'completed').map(c => c.id));
 
-            // Check if the campaign exists and is not completed
-            const campaign = await this.Campaign.findOne({ id: phase.campaignId });
+        // Stale phases to cancel: associated campaign is missing OR completed
+        const cancelPhaseIds = stalePhases
+            .filter(p => !activeCampaignIds.has(p.campaignId))
+            .map(p => p._id);
 
-            if (!campaign) {
-                reason = 'campaign_not_found';
-            } else if (campaign.status === 'completed') {
-                reason = 'campaign_completed';
-            }
-
-            if (reason) {
-                await this.ScheduledRetryPhase.findByIdAndUpdate(phase._id, {
-                    $set: { status: 'cancelled' }
-                });
-
-                cancelledCount++;
-
-                console.log(JSON.stringify({
-                    service: 'RetryScheduler',
-                    event: 'cleanup_orphaned_phase_cancelled',
-                    campaignId: phase.campaignId,
-                    phaseNumber: phase.phaseNumber,
-                    scheduledAt: phase.scheduledAt.toISOString(),
-                    reason,
-                    timestamp: now.toISOString()
-                }));
-            }
+        if (cancelPhaseIds.length > 0) {
+            const updateResult = await this.ScheduledRetryPhase.updateMany(
+                { _id: { $in: cancelPhaseIds } },
+                { $set: { status: 'cancelled' } }
+            );
+            cancelledCount = updateResult.modifiedCount || cancelPhaseIds.length;
         }
 
         console.log(JSON.stringify({

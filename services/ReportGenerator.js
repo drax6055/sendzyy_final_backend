@@ -80,27 +80,34 @@ class ReportGenerator {
         // Use live Recipient counts for accuracy — phaseStats snapshots may be stale
         // if delivery webhooks arrived after the snapshot was taken.
         if (campaign.phaseStats && Array.isArray(campaign.phaseStats)) {
-            for (const phaseStat of campaign.phaseStats) {
-
-                // Live counts from Recipient collection
-                let liveSuccess = phaseStat.successCount;
-                let liveFailure = phaseStat.failureCount;
-
-                if (this.Recipient) {
-                    // successCount = recipients delivered in this phase
-                    liveSuccess = await this.Recipient.countDocuments({
-                        campaignId,
-                        phaseNumber: phaseStat.phaseNumber
-                    });
-
-                    // failureCount = recipients attempted in this phase but not yet delivered
-                    // (phaseNumber still null, with a retryHistory entry for this phase)
-                    liveFailure = await this.Recipient.countDocuments({
-                        campaignId,
-                        phaseNumber: null,
-                        'retryHistory.phaseNumber': phaseStat.phaseNumber
-                    });
+            // Build map of interval hours lookup: phaseNumber -> intervalHours
+            const retryConfigMap = new Map();
+            if (campaign.retryConfig && Array.isArray(campaign.retryConfig.phases)) {
+                for (const p of campaign.retryConfig.phases) {
+                    retryConfigMap.set(p.phaseNumber + 1, p.intervalHours);
                 }
+            }
+
+            // Fetch live counts for all phases in parallel if Recipient model is present
+            const liveCounts = new Map();
+            if (this.Recipient) {
+                const countPromises = campaign.phaseStats.map(async (phaseStat) => {
+                    const [liveSuccess, liveFailure] = await Promise.all([
+                        this.Recipient.countDocuments({ campaignId, phaseNumber: phaseStat.phaseNumber }),
+                        this.Recipient.countDocuments({ campaignId, phaseNumber: null, 'retryHistory.phaseNumber': phaseStat.phaseNumber })
+                    ]);
+                    return { phaseNumber: phaseStat.phaseNumber, liveSuccess, liveFailure };
+                });
+                const countResults = await Promise.all(countPromises);
+                for (const res of countResults) {
+                    liveCounts.set(res.phaseNumber, res);
+                }
+            }
+
+            for (const phaseStat of campaign.phaseStats) {
+                const counts = liveCounts.get(phaseStat.phaseNumber);
+                const liveSuccess = counts ? counts.liveSuccess : phaseStat.successCount;
+                const liveFailure = counts ? counts.liveFailure : phaseStat.failureCount;
 
                 const totalAttempts = liveSuccess + liveFailure;
                 const successRate = totalAttempts > 0
@@ -108,20 +115,7 @@ class ReportGenerator {
                     : 0;
 
                 cumulativeSuccess += liveSuccess;
-
-                // Get interval hours for this phase (Requirement 7.7)
-                let intervalHours = null;
-                if (campaign.retryConfig && 
-                    campaign.retryConfig.phases && 
-                    phaseStat.phaseNumber > 1) {
-                    // For phase N, get interval from phase N-1 in config
-                    const configPhase = campaign.retryConfig.phases.find(
-                        p => p.phaseNumber === phaseStat.phaseNumber - 1
-                    );
-                    if (configPhase) {
-                        intervalHours = configPhase.intervalHours;
-                    }
-                }
+                const intervalHours = retryConfigMap.get(phaseStat.phaseNumber) || null;
 
                 phases.push({
                     phaseNumber: phaseStat.phaseNumber,

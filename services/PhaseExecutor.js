@@ -141,57 +141,61 @@ class PhaseExecutor {
         let failureCount = 0;
         const executedAt = new Date();
 
-        for (const recipient of failedMessages) {
-            try {
-                // Delegate to the injected message sender
-                await this.messageSender.sendMessage(recipient, campaign, phaseNumber);
-                successCount++;
-            } catch (sendErr) {
-                // WhatsApp API failure: mark individual message as failed, continue with remaining messages
-                failureCount++;
-
-                // Log API error with campaign ID, message details, and error info (Req 17.1)
-                console.error(JSON.stringify({
-                    service: 'PhaseExecutor',
-                    event: 'whatsapp_api_error',
-                    campaignId,
-                    phaseNumber,
-                    recipientId: recipient._id ? recipient._id.toString() : null,
-                    to: recipient.to,
-                    wamid: recipient.wamid || null,
-                    error: sendErr.message,
-                    stack: sendErr.stack,
-                    timestamp: new Date().toISOString()
-                }));
-
-                // Record the failed attempt in retry history
+        const BATCH_SIZE = 25;
+        for (let i = 0; i < failedMessages.length; i += BATCH_SIZE) {
+            const chunk = failedMessages.slice(i, i + BATCH_SIZE);
+            await Promise.all(chunk.map(async (recipient) => {
                 try {
-                    await this.Recipient.updateOne(
-                        { _id: recipient._id },
-                        {
-                            $set: { status: 'failed' },
-                            $push: {
-                                retryHistory: {
-                                    phaseNumber,
-                                    attemptedAt: new Date(),
-                                    status: 'failed'
-                                }
-                            }
-                        }
-                    );
-                } catch (histErr) {
+                    // Delegate to the injected message sender
+                    await this.messageSender.sendMessage(recipient, campaign, phaseNumber);
+                    successCount++;
+                } catch (sendErr) {
+                    // WhatsApp API failure: mark individual message as failed, continue with remaining messages
+                    failureCount++;
+
+                    // Log API error with campaign ID, message details, and error info (Req 17.1)
                     console.error(JSON.stringify({
                         service: 'PhaseExecutor',
-                        event: 'retry_history_update_error',
+                        event: 'whatsapp_api_error',
                         campaignId,
                         phaseNumber,
                         recipientId: recipient._id ? recipient._id.toString() : null,
-                        error: histErr.message,
-                        stack: histErr.stack,
+                        to: recipient.to,
+                        wamid: recipient.wamid || null,
+                        error: sendErr.message,
+                        stack: sendErr.stack,
                         timestamp: new Date().toISOString()
                     }));
+
+                    // Record the failed attempt in retry history
+                    try {
+                        await this.Recipient.updateOne(
+                            { _id: recipient._id },
+                            {
+                                $set: { status: 'failed' },
+                                $push: {
+                                    retryHistory: {
+                                        phaseNumber,
+                                        attemptedAt: new Date(),
+                                        status: 'failed'
+                                    }
+                                }
+                            }
+                        );
+                    } catch (histErr) {
+                        console.error(JSON.stringify({
+                            service: 'PhaseExecutor',
+                            event: 'retry_history_update_error',
+                            campaignId,
+                            phaseNumber,
+                            recipientId: recipient._id ? recipient._id.toString() : null,
+                            error: histErr.message,
+                            stack: histErr.stack,
+                            timestamp: new Date().toISOString()
+                        }));
+                    }
                 }
-            }
+            }));
         }
 
         const completedAt = new Date();

@@ -48,43 +48,40 @@ async function recoverExecutingPhases(ScheduledRetryPhase) {
         const now = new Date();
         const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
 
-        for (const phase of executingPhases) {
-            const isRecent = phase.scheduledAt >= oneHourAgo;
+        const recentIds = executingPhases.filter(p => p.scheduledAt >= oneHourAgo).map(p => p._id);
+        const staleIds = executingPhases.filter(p => p.scheduledAt < oneHourAgo).map(p => p._id);
 
-            if (isRecent) {
-                // Within 1 hour — reset to pending so the cron job retries it
-                await ScheduledRetryPhase.findByIdAndUpdate(phase._id, {
-                    $set: { status: 'pending' }
-                });
+        if (recentIds.length > 0) {
+            await ScheduledRetryPhase.updateMany(
+                { _id: { $in: recentIds } },
+                { $set: { status: 'pending' } }
+            );
+            console.log(JSON.stringify({
+                service: 'Scheduler',
+                event: 'startup_recovery_reset_batch',
+                count: recentIds.length,
+                message: 'Reset to pending — scheduledAt within 1 hour',
+                timestamp: now.toISOString()
+            }));
+        }
 
-                console.log(JSON.stringify({
-                    service: 'Scheduler',
-                    event: 'startup_recovery_reset',
-                    campaignId: phase.campaignId,
-                    phaseNumber: phase.phaseNumber,
-                    scheduledAt: phase.scheduledAt.toISOString(),
-                    message: 'Reset to pending — scheduledAt within 1 hour',
-                    timestamp: now.toISOString()
-                }));
-            } else {
-                // Older than 1 hour — mark as failed
-                await ScheduledRetryPhase.findByIdAndUpdate(phase._id, {
+        if (staleIds.length > 0) {
+            await ScheduledRetryPhase.updateMany(
+                { _id: { $in: staleIds } },
+                {
                     $set: {
                         status: 'failed',
-                        errorMessage: `Phase abandoned on server restart. Originally scheduled at ${phase.scheduledAt.toISOString()}, which is more than 1 hour ago.`
+                        errorMessage: 'Phase abandoned on server restart (scheduled more than 1 hour ago).'
                     }
-                });
-
-                console.log(JSON.stringify({
-                    service: 'Scheduler',
-                    event: 'startup_recovery_failed',
-                    campaignId: phase.campaignId,
-                    phaseNumber: phase.phaseNumber,
-                    scheduledAt: phase.scheduledAt.toISOString(),
-                    message: 'Marked as failed — scheduledAt older than 1 hour',
-                    timestamp: now.toISOString()
-                }));
-            }
+                }
+            );
+            console.log(JSON.stringify({
+                service: 'Scheduler',
+                event: 'startup_recovery_failed_batch',
+                count: staleIds.length,
+                message: 'Marked as failed — scheduledAt older than 1 hour',
+                timestamp: now.toISOString()
+            }));
         }
 
         console.log(JSON.stringify({
