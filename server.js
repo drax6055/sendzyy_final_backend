@@ -188,6 +188,7 @@ const messageSchema = new mongoose.Schema({
     templateBody: { type: String },          // resolved body text of the template
     interactivePayload: { type: mongoose.Schema.Types.Mixed }, // { type, title, id }
     wamid: { type: String },                 // WhatsApp message ID from Meta
+    contextMessageId: { type: String },      // WhatsApp message ID of the replied-to message (if any)
     status: { type: String, default: 'sent' }, // 'sent' | 'delivered' | 'read' | 'failed'
     errorDetails: { type: String },         // Why message failed
     source: { type: String, default: null }, // 'chatbot' | 'chatbot_reply' | 'chatbot_trigger' | null (null = live chat)
@@ -2622,7 +2623,7 @@ app.delete('/api/chatbots/:id', authenticate, async (req, res) => {
 
 //  Send Message 
 app.post('/send-message', authenticate, async (req, res) => {
-    const { to, type, template, text, mediaId, mediaType, campaignId, recipientName } = req.body;
+    const { to, type, template, text, mediaId, mediaType, campaignId, recipientName, replyToMessageId, replyToWamid } = req.body;
     const tenantId = req.user.tenantId;
     try {
         const tenant = await Tenant.findById(tenantId);
@@ -2634,6 +2635,13 @@ app.post('/send-message', authenticate, async (req, res) => {
 
         // Build payload
         const payload = { messaging_product: 'whatsapp', to, type: type || 'template' };
+        const targetWamid = (replyToWamid && typeof replyToWamid === 'string' && replyToWamid.startsWith('wamid.'))
+            ? replyToWamid
+            : ((replyToMessageId && typeof replyToMessageId === 'string' && replyToMessageId.startsWith('wamid.')) ? replyToMessageId : null);
+
+        if (targetWamid) {
+            payload.context = { message_id: targetWamid };
+        }
         if (type === 'text') {
             payload.text = { body: text };
         } else if (type === 'template') {
@@ -2791,6 +2799,7 @@ app.post('/send-message', authenticate, async (req, res) => {
                 templateBody: outboundTemplateBody,
                 mediaUrl: ['image', 'video', 'audio', 'document'].includes(type) ? mediaId : null,
                 wamid: wamid || null,
+                contextMessageId: replyToMessageId || replyToWamid || null,
                 status: 'sent',
             });
             await broadcastConversations(tenantId);
@@ -3396,6 +3405,7 @@ app.get('/conversations/:contactId/messages', authenticate, async (req, res) => 
             mediaUrl: m.mediaUrl || null,
             interactivePayload: m.interactivePayload || null,
             wamid: m.wamid || null,
+            contextMessageId: m.contextMessageId || null,
             status: m.status || 'sent',
             errorDetails: m.errorDetails || null,
             source: m.source || null,
@@ -5268,6 +5278,7 @@ async function handleQuickReplyNode(session, node, tenant, from) {
     }
     try {
         // ── Step 1: Send via WhatsApp API ────────────────────────────────────
+        
         const _qrResp = await axios.post(
             `${WHATSAPP_API_URL}/${phoneNumberId}/messages`,
             {
@@ -6037,6 +6048,8 @@ async function handleLiveChat(tenantId, message, profileName, from) {
         messageType: msgType,
         mediaUrl,
         interactivePayload,
+        wamid: message.id || null,
+        contextMessageId: message.context?.id || null,
     });
     await broadcastConversations(tenantId);
     await broadcastMessages(tenantId, from);
@@ -6414,6 +6427,8 @@ io.on('connection', (socket) => {
                     templateBody: m.templateBody || null,
                     mediaUrl: m.mediaUrl || null,
                     interactivePayload: m.interactivePayload || null,
+                    wamid: m.wamid || null,
+                    contextMessageId: m.contextMessageId || null,
                 };
             });
             socket.emit('messages_' + contactId, formatted);
@@ -6460,6 +6475,7 @@ async function broadcastMessages(tenantId, contactId) {
                 mediaUrl: m.mediaUrl || null,
                 interactivePayload: m.interactivePayload || null,
                 wamid: m.wamid || null,
+                contextMessageId: m.contextMessageId || null,
                 status: m.status || 'sent',
                 errorDetails: m.errorDetails || null,
                 source: m.source || null,
