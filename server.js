@@ -189,6 +189,7 @@ const messageSchema = new mongoose.Schema({
     interactivePayload: { type: mongoose.Schema.Types.Mixed }, // { type, title, id }
     wamid: { type: String },                 // WhatsApp message ID from Meta
     contextMessageId: { type: String },      // WhatsApp message ID of the replied-to message (if any)
+    replyContextPreview: { type: String, default: null }, // Snapshot of replied-to message text/preview
     status: { type: String, default: 'sent' }, // 'sent' | 'delivered' | 'read' | 'failed'
     errorDetails: { type: String },         // Why message failed
     source: { type: String, default: null }, // 'chatbot' | 'chatbot_reply' | 'chatbot_trigger' | null (null = live chat)
@@ -2635,9 +2636,27 @@ app.post('/send-message', authenticate, async (req, res) => {
 
         // Build payload
         const payload = { messaging_product: 'whatsapp', to, type: type || 'template' };
-        const targetWamid = (replyToWamid && typeof replyToWamid === 'string' && replyToWamid.startsWith('wamid.'))
+        let targetWamid = (replyToWamid && typeof replyToWamid === 'string' && replyToWamid.startsWith('wamid.'))
             ? replyToWamid
             : ((replyToMessageId && typeof replyToMessageId === 'string' && replyToMessageId.startsWith('wamid.')) ? replyToMessageId : null);
+
+        let replyContextPreview = null;
+        if (replyToMessageId || targetWamid) {
+            try {
+                const query = targetWamid
+                    ? { wamid: targetWamid }
+                    : (mongoose.Types.ObjectId.isValid(replyToMessageId) ? { _id: replyToMessageId } : { wamid: replyToMessageId });
+                const parentMsg = await Message.findOne(query).lean();
+                if (parentMsg) {
+                    if (!targetWamid && parentMsg.wamid && typeof parentMsg.wamid === 'string' && parentMsg.wamid.startsWith('wamid.')) {
+                        targetWamid = parentMsg.wamid;
+                    }
+                    replyContextPreview = parentMsg.text || parentMsg.templateBody || (parentMsg.templateName ? `📋 ${parentMsg.templateName}` : null) || (parentMsg.messageType ? `[${parentMsg.messageType}]` : null);
+                }
+            } catch (err) {
+                console.error(' Error resolving reply context:', err.message);
+            }
+        }
 
         if (targetWamid) {
             payload.context = { message_id: targetWamid };
@@ -2799,7 +2818,8 @@ app.post('/send-message', authenticate, async (req, res) => {
                 templateBody: outboundTemplateBody,
                 mediaUrl: ['image', 'video', 'audio', 'document'].includes(type) ? mediaId : null,
                 wamid: wamid || null,
-                contextMessageId: replyToMessageId || replyToWamid || null,
+                contextMessageId: targetWamid || replyToWamid || replyToMessageId || null,
+                replyContextPreview: replyContextPreview || null,
                 status: 'sent',
             });
             await broadcastConversations(tenantId);
@@ -3406,6 +3426,7 @@ app.get('/conversations/:contactId/messages', authenticate, async (req, res) => 
             interactivePayload: m.interactivePayload || null,
             wamid: m.wamid || null,
             contextMessageId: m.contextMessageId || null,
+            replyContextPreview: m.replyContextPreview || null,
             status: m.status || 'sent',
             errorDetails: m.errorDetails || null,
             source: m.source || null,
@@ -4924,6 +4945,8 @@ async function saveChatbotMessageToDB({
     wamid = null,
     previewText,
     name = null,
+    contextMessageId = null,
+    replyContextPreview = null,
 }) {
     const now = new Date();
 
@@ -4944,6 +4967,8 @@ async function saveChatbotMessageToDB({
         templateName,
         templateBody,
         wamid,
+        contextMessageId,
+        replyContextPreview,
         status: isMe ? 'sent' : undefined,
     });
 
@@ -6034,6 +6059,25 @@ async function handleLiveChat(tenantId, message, profileName, from) {
 
     console.log(` [Tenant: ${tenantId}] Incoming from ${from} (${profileName}): ${lastMessagePreview}`);
 
+    // Lookup parent message preview if message is a reply
+    let replyContextPreview = null;
+    const contextWamid = message.context?.id || null;
+    if (contextWamid) {
+        try {
+            const parentMsg = await Message.findOne({
+                $or: [
+                    { wamid: contextWamid },
+                    ...(mongoose.Types.ObjectId.isValid(contextWamid) ? [{ _id: contextWamid }] : [])
+                ]
+            }).lean();
+            if (parentMsg) {
+                replyContextPreview = parentMsg.text || parentMsg.templateBody || (parentMsg.templateName ? `📋 ${parentMsg.templateName}` : null) || (parentMsg.messageType ? `[${parentMsg.messageType}]` : null);
+            }
+        } catch (err) {
+            console.error('[Webhook] Error finding parent message for context:', err.message);
+        }
+    }
+
     await Conversation.findOneAndUpdate(
         { tenantId, contactId: from },
         { name: profileName, lastMessage: lastMessagePreview, lastActive: new Date(), hasReply: true },
@@ -6049,7 +6093,8 @@ async function handleLiveChat(tenantId, message, profileName, from) {
         mediaUrl,
         interactivePayload,
         wamid: message.id || null,
-        contextMessageId: message.context?.id || null,
+        contextMessageId: contextWamid,
+        replyContextPreview: replyContextPreview || null,
     });
     await broadcastConversations(tenantId);
     await broadcastMessages(tenantId, from);
@@ -6429,6 +6474,7 @@ io.on('connection', (socket) => {
                     interactivePayload: m.interactivePayload || null,
                     wamid: m.wamid || null,
                     contextMessageId: m.contextMessageId || null,
+                    replyContextPreview: m.replyContextPreview || null,
                 };
             });
             socket.emit('messages_' + contactId, formatted);
@@ -6476,6 +6522,7 @@ async function broadcastMessages(tenantId, contactId) {
                 interactivePayload: m.interactivePayload || null,
                 wamid: m.wamid || null,
                 contextMessageId: m.contextMessageId || null,
+                replyContextPreview: m.replyContextPreview || null,
                 status: m.status || 'sent',
                 errorDetails: m.errorDetails || null,
                 source: m.source || null,
