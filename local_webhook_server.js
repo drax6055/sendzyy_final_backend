@@ -16,7 +16,7 @@ const app = express();
 app.use(bodyParser.json());
 
 const PORT = 3000;
-const VERIFY_TOKEN = "app.sendzyy_auth$token@1502200214082002%&asdavcwrgwwvtsrfw453rtbruyntyu";
+const VERIFY_TOKEN = "app_sendzyy_auth_token_1502200214082002";
 
 // 2. Webhook Verification (for Meta)
 app.get('/webhook', (req, res) => {
