@@ -7647,6 +7647,18 @@ app.get('/api/tenant/openai-key-status', authenticate, async (req, res) => {
     }
 });
 
+// GET /api/tenant/openai-key/reveal (authenticated)
+app.get('/api/tenant/openai-key/reveal', authenticate, async (req, res) => {
+    try {
+        const tenant = await Tenant.findById(req.user.tenantId);
+        if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+        res.json({ key: tenant.openaiApiKey || '' });
+    } catch (err) {
+        console.error('Error revealing OpenAI key:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // PUT /api/tenant/openai-key (authenticated)
 app.put('/api/tenant/openai-key', authenticate, async (req, res) => {
     const { apiKey } = req.body;
