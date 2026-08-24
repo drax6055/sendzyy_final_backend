@@ -75,6 +75,13 @@ const tenantSchema = new mongoose.Schema({
     },
     webhookSecret: { type: String, default: '' },  // AES-256 encrypted hex string
     openaiApiKey: { type: String, default: '' },
+    instagramConfig: {
+        instagramAccountId: { type: String, default: '' },
+        username: { type: String, default: '' },
+        accessToken: { type: String, default: '' },
+        tokenExpiry: { type: Date, default: null },
+        connected: { type: Boolean, default: false }
+    },
 }, { timestamps: true });
 const Tenant = mongoose.model('Tenant', tenantSchema);
 
@@ -351,7 +358,7 @@ const leadSchema = new mongoose.Schema({
     mobileNumber: { type: String, required: true },   // normalised, e.g. "919876543210"
     email: { type: String, default: '' },
     companyName: { type: String, default: '' },
-    source: { type: String, enum: ['shopify', 'wordpress'], required: true },
+    source: { type: String, enum: ['shopify', 'wordpress', 'indiamart'], required: true },
     formName: { type: String, default: '' },
     metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
     status: { type: String, enum: ['new', 'contacted', 'converted', 'failed'], default: 'new' },
@@ -364,7 +371,7 @@ const Lead = mongoose.model('Lead', leadSchema);
 
 const leadTriggerSchema = new mongoose.Schema({
     tenantId: { type: String, required: true },
-    source: { type: String, enum: ['shopify', 'wordpress', 'any'], default: 'any' },
+    source: { type: String, enum: ['shopify', 'wordpress', 'indiamart', 'any'], default: 'any' },
     formName: { type: String, default: '' },
     action: { type: String, enum: ['send_template', 'start_chatbot'], required: true },
     templateName: { type: String, default: '' },
@@ -409,6 +416,15 @@ const onboardingLogSchema = new mongoose.Schema({
     timestamp: { type: Date, default: Date.now, expires: 2592000 }, // TTL 30 days
 });
 const OnboardingLog = mongoose.model('OnboardingLog', onboardingLogSchema);
+
+const indiaMartConfigSchema = new mongoose.Schema({
+    tenantId: { type: String, required: true, unique: true },
+    glusrMobile: { type: String, required: true },
+    glusrCrmKey: { type: String, required: true },
+    lastSyncedAt: { type: Date, default: null }
+}, { timestamps: true });
+indiaMartConfigSchema.index({ tenantId: 1 });
+const IndiaMartConfig = mongoose.model('IndiaMartConfig', indiaMartConfigSchema);
 
 async function saveOnboardingLog({ tenantId, sessionId, wabaId, businessPortfolioId, phoneNumberId, step, status = 'info', message, details }) {
     try {
@@ -679,6 +695,24 @@ app.use(bodyParser.raw({
     },
     limit: '50mb'
 }));
+
+// Root route response
+app.get('/', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Sendzyy | Backend Server</title>
+        </head>
+        <body>
+            <h1>✅ Sendzyy is running </h1>
+            <p>IFLORA - Sendzyy backend server running</p>
+        </body>
+        </html>
+    `);
+});
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'whatsapp_bulk_verify_token_123';
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v25.0';
@@ -977,6 +1011,199 @@ const authenticate = (req, res, next) => {
         next();
     });
 };
+
+// ── Instagram OAuth Connection Flow ──────────────────────────────────────────
+
+// 1. Initiate Instagram OAuth Flow
+app.get('/api/instagram/auth', authenticate, (req, res) => {
+    try {
+        const token = req.headers['authorization']?.split(' ')[1] || req.query.token;
+        const clientId = process.env.INSTAGRAM_CLIENT_ID;
+        const redirectUri = 'https://app.sendzyy.com/';
+        const scope = 'instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments,instagram_business_content_publish,instagram_business_manage_insights';
+        
+        // Pass the JWT token as state so we can securely retrieve the tenant ID on callback
+        const authUrl = `https://www.instagram.com/oauth/authorize?force_reauth=true&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}&state=${token}`;
+        
+        return res.redirect(authUrl);
+    } catch (error) {
+        console.error('Error initiating Instagram Auth:', error);
+        return res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// 2. OAuth Callback Handler
+app.get('/api/instagram/callback', async (req, res) => {
+    const { code, state, frontend_url } = req.query;
+    
+    // Fallback to local default frontend if not passed
+    const defaultFrontend = 'https://app.sendzyy.com';
+    const targetFrontend = frontend_url || defaultFrontend;
+    
+    if (!code || !state) {
+        console.error('Instagram Callback Error: Missing code or state');
+        return res.redirect(`${targetFrontend}/#/instagram-profile-setup?error=${encodeURIComponent('Missing code or state')}`);
+    }
+    
+    // Verify state (contains JWT token)
+    jwt.verify(state, process.env.JWT_SECRET, async (err, user) => {
+        if (err || !user?.tenantId) {
+            console.error('Instagram Callback Error: Invalid state token');
+            return res.redirect(`${targetFrontend}/#/instagram-profile-setup?error=${encodeURIComponent('Session expired or invalid state')}`);
+        }
+        
+        const tenantId = user.tenantId;
+        
+        try {
+            const clientId = process.env.INSTAGRAM_CLIENT_ID;
+            const clientSecret = process.env.INSTAGRAM_CLIENT_SECRET || process.env.META_APP_SECRET;
+            
+            if (!clientSecret) {
+                throw new Error('INSTAGRAM_CLIENT_SECRET or META_APP_SECRET not configured');
+            }
+            
+            // Exchange code for short-lived access token
+            const tokenParams = new URLSearchParams();
+            tokenParams.append('client_id', clientId);
+            tokenParams.append('client_secret', clientSecret);
+            tokenParams.append('grant_type', 'authorization_code');
+            tokenParams.append('redirect_uri', 'https://app.sendzyy.com/');
+            tokenParams.append('code', code);
+            
+            console.log('Exchanging auth code for short-lived Instagram token...');
+            const tokenResponse = await axios.post('https://api.instagram.com/oauth/access_token', tokenParams, {
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+            });
+            
+            const { access_token: shortLivedToken } = tokenResponse.data;
+            
+            // Exchange short-lived token for long-lived token
+            console.log('Exchanging short-lived token for long-lived Instagram token...');
+            const longLivedResponse = await axios.get('https://graph.instagram.com/access_token', {
+                params: {
+                    grant_type: 'ig_exchange_token',
+                    client_secret: clientSecret,
+                    access_token: shortLivedToken
+                }
+            });
+            
+            const { access_token: longLivedToken, expires_in } = longLivedResponse.data;
+            
+            // Retrieve Instagram Profile Information
+            console.log('Fetching Instagram user profile...');
+            const profileResponse = await axios.get('https://graph.instagram.com/me', {
+                params: {
+                    fields: 'id,username,name',
+                    access_token: longLivedToken
+                }
+            });
+            
+            const { id: instagramAccountId, username, name } = profileResponse.data;
+            const tokenExpiry = expires_in ? new Date(Date.now() + expires_in * 1000) : null;
+            
+            // Save to Tenant database
+            const tenant = await Tenant.findById(tenantId);
+            if (!tenant) {
+                console.error(`Tenant not found: ${tenantId}`);
+                return res.redirect(`${targetFrontend}/#/instagram-profile-setup?error=${encodeURIComponent('Tenant not found')}`);
+            }
+            
+            tenant.instagramConfig = {
+                instagramAccountId,
+                username,
+                name: name || username,
+                accessToken: longLivedToken,
+                tokenExpiry,
+                connected: true
+            };
+            
+            await tenant.save();
+            console.log(`Instagram account ${username} successfully connected to tenant ${tenantId}`);
+            
+            // Redirect back to Sendzyy Dashboard (this triggers reload)
+            return res.redirect(`${targetFrontend}/`);
+        } catch (error) {
+            console.error('Error during Instagram token exchange/profile fetch:', error.response?.data || error.message);
+            const errMsg = error.response?.data?.error_message || error.message || 'Token exchange failed';
+            return res.redirect(`${targetFrontend}/#/instagram-profile-setup?error=${encodeURIComponent(errMsg)}`);
+        }
+    });
+});
+
+// 3. Get Instagram Profile
+app.get('/api/instagram/profile', authenticate, async (req, res) => {
+    try {
+        const tenant = await Tenant.findById(req.user.tenantId);
+        if (!tenant) {
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+        
+        let config = tenant.instagramConfig || { connected: false };
+        
+        // Auto-refresh long-lived token if it is connected and expires in less than 15 days
+        if (config.connected && config.accessToken && config.tokenExpiry) {
+            const expiryTime = new Date(config.tokenExpiry).getTime();
+            const timeDiff = expiryTime - Date.now();
+            const fifteenDaysInMs = 15 * 24 * 60 * 60 * 1000;
+            
+            if (timeDiff > 0 && timeDiff < fifteenDaysInMs) {
+                console.log(`Instagram long-lived token for tenant ${tenant._id} is expiring soon. Refreshing...`);
+                try {
+                    const refreshResponse = await axios.get('https://graph.instagram.com/refresh_access_token', {
+                        params: {
+                            grant_type: 'ig_refresh_token',
+                            access_token: config.accessToken
+                        }
+                    });
+                    
+                    const { access_token: newAccessToken, expires_in: newExpiresIn } = refreshResponse.data;
+                    const newTokenExpiry = newExpiresIn ? new Date(Date.now() + newExpiresIn * 1000) : null;
+                    
+                    tenant.instagramConfig.accessToken = newAccessToken;
+                    tenant.instagramConfig.tokenExpiry = newTokenExpiry;
+                    await tenant.save();
+                    
+                    config = tenant.instagramConfig;
+                    console.log('Instagram long-lived token refreshed successfully.');
+                } catch (refreshErr) {
+                    console.error('Failed to auto-refresh Instagram token:', refreshErr.response?.data || refreshErr.message);
+                    // Continue returning the old profile even if refresh fails (might still be valid for a few days)
+                }
+            }
+        }
+        
+        return res.json(config);
+    } catch (error) {
+        console.error('Error fetching Instagram profile:', error);
+        return res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// 4. Disconnect Instagram Profile
+app.post('/api/instagram/disconnect', authenticate, async (req, res) => {
+    try {
+        const tenant = await Tenant.findById(req.user.tenantId);
+        if (!tenant) {
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+        
+        tenant.instagramConfig = {
+            instagramAccountId: '',
+            username: '',
+            name: '',
+            accessToken: '',
+            tokenExpiry: null,
+            connected: false
+        };
+        
+        await tenant.save();
+        console.log(`Instagram disconnected successfully for tenant: ${tenant._id}`);
+        return res.json({ success: true, message: 'Instagram profile disconnected' });
+    } catch (error) {
+        console.error('Error disconnecting Instagram:', error);
+        return res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
 
 //  System Update broadcast (triggered via Postman/admin)
 app.post('/api/admin/system-update', (req, res) => {
@@ -3782,7 +4009,7 @@ app.post('/api/whatsapp/register-phone', authenticate, async (req, res) => {
                 if (pd.throughput?.level)    metaFields['whatsappConfig.throughputLevel'] = pd.throughput.level;
                 console.log(`[POST /api/whatsapp/register-phone] ✅ Fetched Meta phone metadata:`, pd);
             } catch (metaErr) {
-                console.warn(`[POST /api/whatsapp/register-phone] ⚠️  Could not fetch phone metadata from Meta after registration:`, metaErr.response?.data || metaErr.message);
+                console.warn(`[POST /api/whatsapp/register-phone] ⚠️ Could not fetch phone metadata from Meta after registration:`, metaErr.response?.data || metaErr.message);
             }
 
             await Tenant.findByIdAndUpdate(tenantId, {
@@ -7286,6 +7513,7 @@ app.post('/api/leads/webhook/:tenantId', webhookRateLimiter, async (req, res) =>
                 mobileNumber: normalisedMobile,
                 emailId: sanitised.email || '',
                 companyName: sanitised.companyName || '',
+                venue: rawPayload.venue || '-',
             });
             clientId = newClient._id;
         }
@@ -7366,6 +7594,234 @@ app.get('/api/leads/webhook-secret', authenticate, async (req, res) => {
         res.json({ maskedSecret: maskSecret(plainSecret) });
     } catch (err) {
         console.error('Error fetching webhook secret:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Helper function to pull and persist IndiaMART leads
+async function syncIndiaMartLeads(tenantId, config, startDate = null, endDate = null) {
+    const { glusrCrmKey } = config;
+    let url = `https://mapi.indiamart.com/wservce/crm/crmListing/v2/?glusr_crm_key=${glusrCrmKey}`;
+    
+    if (startDate && endDate) {
+        // Format ISO dates (e.g. YYYY-MM-DD) to DD-MON-YYYY
+        const formatIndiaMartDate = (dateStr) => {
+            const d = new Date(dateStr);
+            if (isNaN(d.getTime())) return null;
+            const day = String(d.getDate()).padStart(2, '0');
+            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            const month = months[d.getMonth()];
+            const year = d.getFullYear();
+            return `${day}-${month}-${year}`;
+        };
+        const startFormatted = formatIndiaMartDate(startDate);
+        const endFormatted = formatIndiaMartDate(endDate);
+        if (startFormatted && endFormatted) {
+            url += `&start_time=${startFormatted}&end_time=${endFormatted}`;
+        }
+    }
+
+    const response = await axios.get(url, { timeout: 15000 });
+    const data = response.data;
+
+    // Check IndiaMART API status
+    if (data.CODE !== 200 || data.STATUS !== 'SUCCESS') {
+        const errMsg = data.MESSAGE || 'IndiaMART API returned failure status';
+        const error = new Error(errMsg);
+        error.code = data.CODE;
+        error.status = data.STATUS;
+        throw error;
+    }
+
+    const records = data.RESPONSE || [];
+    let newLeadsCount = 0;
+
+    for (const rec of records) {
+        // Parse and validate sender mobile
+        const normalisedMobile = normaliseMobileNumber(rec.SENDER_MOBILE);
+        if (!normalisedMobile || !validateMobileNumber(normalisedMobile)) {
+            continue;
+        }
+
+        // Deduplication using UNIQUE_QUERY_ID
+        const queryId = rec.UNIQUE_QUERY_ID;
+        if (!queryId) continue;
+
+        const queryExists = await Lead.findOne({
+            tenantId,
+            'metadata.UNIQUE_QUERY_ID': queryId
+        });
+        if (queryExists) {
+            continue;
+        }
+
+        // Check deduplication against Clients collection
+        const existingClient = await Client.findOne({ tenantId, mobileNumber: normalisedMobile });
+        const isDuplicate = !!existingClient;
+
+        let clientId;
+        if (isDuplicate) {
+            clientId = existingClient._id;
+        } else {
+            const newClient = await Client.create({
+                tenantId,
+                name: rec.SENDER_NAME || '',
+                mobileNumber: normalisedMobile,
+                emailId: rec.SENDER_EMAIL || '',
+                companyName: rec.SENDER_COMPANY || '',
+                venue: rec.SENDER_ADDRESS || '-',
+            });
+            clientId = newClient._id;
+        }
+
+        // Parse QUERY_TIME: "2021-12-08 12:47:25"
+        let parsedCreatedAt = new Date();
+        if (rec.QUERY_TIME) {
+            const t = new Date(rec.QUERY_TIME.replace(' ', 'T'));
+            if (!isNaN(t.getTime())) {
+                parsedCreatedAt = t;
+            }
+        }
+
+        const lead = await Lead.create({
+            tenantId,
+            name: rec.SENDER_NAME || '',
+            mobileNumber: normalisedMobile,
+            email: rec.SENDER_EMAIL || '',
+            companyName: rec.SENDER_COMPANY || '',
+            source: 'indiamart',
+            metadata: rec,
+            isDuplicate,
+            clientId,
+            createdAt: parsedCreatedAt,
+        });
+
+        newLeadsCount++;
+
+        // Trigger welcome messages or chatbot flows
+        evaluateTriggers(tenantId, lead).catch(err => {
+            console.error(`[IndiaMartSync] evaluateTriggers error for lead ${lead._id}:`, err.message);
+        });
+    }
+
+    // Update lastSyncedAt only if it was a recent pull (not a custom historical pull)
+    if (!startDate && !endDate) {
+        config.lastSyncedAt = new Date();
+        await config.save();
+    }
+
+    return { totalRecords: records.length, newLeadsCount };
+}
+
+// ── IndiaMART Integration Routes ──────────────────────────────────────────────────
+
+// GET /api/integrations/indiamart
+app.get('/api/integrations/indiamart', authenticate, async (req, res) => {
+    const tenantId = req.user.tenantId;
+    try {
+        const config = await IndiaMartConfig.findOne({ tenantId });
+        if (!config) {
+            return res.json({ connected: false });
+        }
+        res.json({
+            connected: true,
+            glusrMobile: config.glusrMobile,
+            lastSyncedAt: config.lastSyncedAt
+        });
+    } catch (err) {
+        console.error('Error fetching IndiaMART config:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// POST /api/integrations/indiamart
+app.post('/api/integrations/indiamart', authenticate, async (req, res) => {
+    const tenantId = req.user.tenantId;
+    const { glusrMobile, glusrCrmKey } = req.body;
+
+    if (!glusrMobile || !glusrCrmKey) {
+        return res.status(400).json({ error: 'glusrMobile and glusrCrmKey are required' });
+    }
+
+    try {
+        // Create a temporary configuration to dry-run/validate the credentials
+        const tempConfig = new IndiaMartConfig({
+            tenantId,
+            glusrMobile,
+            glusrCrmKey
+        });
+
+        // Try syncing leads to validate credentials
+        const syncResult = await syncIndiaMartLeads(tenantId, tempConfig);
+
+        // If sync succeeds, save/upsert configuration to database
+        const config = await IndiaMartConfig.findOneAndUpdate(
+            { tenantId },
+            { glusrMobile, glusrCrmKey, lastSyncedAt: tempConfig.lastSyncedAt },
+            { new: true, upsert: true }
+        );
+
+        res.json({
+            message: 'IndiaMART integration connected successfully',
+            config: {
+                glusrMobile: config.glusrMobile,
+                lastSyncedAt: config.lastSyncedAt
+            },
+            syncResult
+        });
+    } catch (err) {
+        console.error('Error connecting IndiaMART:', err);
+        
+        // Check if error is an authentication/invalid key error from IndiaMART API
+        const isAuthError = err.code === 400 || (err.status && err.status.toUpperCase() === 'FAILURE') || err.message.includes('Key');
+        if (isAuthError) {
+            return res.status(401).json({
+                error: err.message || 'Invalid IndiaMART CRM API Key',
+                code: 'KEY_EXPIRED'
+            });
+        }
+        res.status(500).json({ error: 'Failed to connect IndiaMART: ' + err.message });
+    }
+});
+
+// POST /api/integrations/indiamart/sync
+app.post('/api/integrations/indiamart/sync', authenticate, async (req, res) => {
+    const tenantId = req.user.tenantId;
+    const { startDate, endDate } = req.body;
+
+    try {
+        const config = await IndiaMartConfig.findOne({ tenantId });
+        if (!config) {
+            return res.status(400).json({ error: 'IndiaMART integration not connected' });
+        }
+
+        const syncResult = await syncIndiaMartLeads(tenantId, config, startDate, endDate);
+        res.json({
+            message: 'Sync completed successfully',
+            lastSyncedAt: config.lastSyncedAt,
+            syncResult
+        });
+    } catch (err) {
+        console.error('Error syncing IndiaMART leads:', err);
+        const isAuthError = err.code === 400 || (err.status && err.status.toUpperCase() === 'FAILURE') || err.message.includes('Key');
+        if (isAuthError) {
+            return res.status(401).json({
+                error: 'IndiaMART CRM key has expired or is invalid. Please update the key.',
+                code: 'KEY_EXPIRED'
+            });
+        }
+        res.status(500).json({ error: 'Sync failed: ' + err.message });
+    }
+});
+
+// DELETE /api/integrations/indiamart
+app.delete('/api/integrations/indiamart', authenticate, async (req, res) => {
+    const tenantId = req.user.tenantId;
+    try {
+        await IndiaMartConfig.deleteOne({ tenantId });
+        res.json({ success: true, message: 'IndiaMART integration disconnected' });
+    } catch (err) {
+        console.error('Error disconnecting IndiaMART:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
