@@ -1,7 +1,6 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-setInterval(() => { }, 100000);
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const axios = require('axios');
@@ -20,6 +19,8 @@ if (process.env.MONGODB_URI) {
     mongoose.connect(process.env.MONGODB_URI)
         .then(async () => {
             console.log(' MongoDB connected');
+            // Seed panel packages into database table if missing
+            await seedPanelPackages();
             // Drop the old unique compound index on {tenantId, version} if it exists.
             // We now use a single-field unique index on {tenantId} since one doc per tenant.
             try {
@@ -82,6 +83,7 @@ const tenantSchema = new mongoose.Schema({
         tokenExpiry: { type: Date, default: null },
         connected: { type: Boolean, default: false }
     },
+    status: { type: String, enum: ['active', 'inactive'], default: 'active' },
 }, { timestamps: true });
 const Tenant = mongoose.model('Tenant', tenantSchema);
 
@@ -101,20 +103,72 @@ clientSchema.index({ tenantId: 1, companyName: 1 });
 
 const Client = mongoose.model('Client', clientSchema);
 
-// Panel plans — base prices with 18% GST included in totalPrice
-const PANEL_PLANS = [
-    { id: 'panel_1m', name: '1 Month Access', description: '1 month full panel access', basePrice: Math.round(1499 / 1.18), gstPercent: 18, totalPrice: 1499, panelDays: 30 },
-    { id: 'panel_3m', name: '3 Month Access', description: '3 months full panel access', basePrice: Math.round(3999 / 1.18), gstPercent: 18, totalPrice: 3999, panelDays: 90 },
-    { id: 'panel_6m', name: '6 Month Access', description: '6 months full panel access', basePrice: Math.round(7499 / 1.18), gstPercent: 18, totalPrice: 7499, panelDays: 180 },
-    { id: 'panel_12m', name: '12 Month Access', description: '12 months full panel access', basePrice: Math.round(14999 / 1.18), gstPercent: 18, totalPrice: 14999, panelDays: 365 },
+// Panel Package Schema & Model
+const panelPackageSchema = new mongoose.Schema({
+    planId: { type: String, required: true, unique: true },
+    name: { type: String, required: true },
+    description: { type: String, default: '' },
+    basePrice: { type: Number, required: true },
+    gstPercent: { type: Number, default: 18 },
+    totalPrice: { type: Number, required: true },
+    panelDays: { type: Number, required: true },
+    isActive: { type: Boolean, default: true },
+}, { timestamps: true });
+
+const PanelPackage = mongoose.model('PanelPackage', panelPackageSchema);
+
+const INITIAL_PANEL_PACKAGES = [
+    { planId: 'panel_1m', name: '1 Month Access', description: '1 month full panel access', basePrice: Math.round(1499 / 1.18), gstPercent: 18, totalPrice: 1499, panelDays: 30 },
+    { planId: 'panel_3m', name: '3 Month Access', description: '3 months full panel access', basePrice: Math.round(3999 / 1.18), gstPercent: 18, totalPrice: 3999, panelDays: 90 },
+    { planId: 'panel_6m', name: '6 Month Access', description: '6 months full panel access', basePrice: Math.round(7499 / 1.18), gstPercent: 18, totalPrice: 7499, panelDays: 180 },
+    { planId: 'panel_12m', name: '12 Month Access', description: '12 months full panel access', basePrice: Math.round(14999 / 1.18), gstPercent: 18, totalPrice: 14999, panelDays: 365 },
 ];
 
-function getPlanById(planId) {
-    return PANEL_PLANS.find(p => p.id === planId) || PANEL_PLANS[3]; // default to 12m
+async function seedPanelPackages() {
+    try {
+        for (const pkg of INITIAL_PANEL_PACKAGES) {
+            await PanelPackage.findOneAndUpdate(
+                { planId: pkg.planId },
+                { $setOnInsert: pkg },
+                { upsert: true, new: true }
+            );
+        }
+        console.log(' Panel packages seeded successfully');
+    } catch (err) {
+        console.error(' Failed to seed panel packages:', err);
+    }
 }
 
-// Keep PANEL_PLAN as alias for backward compat (defaults to 12m plan)
-const PANEL_PLAN = PANEL_PLANS[3];
+async function getPlanById(planId) {
+    try {
+        let plan = null;
+        if (planId) {
+            plan = await PanelPackage.findOne({ planId: planId });
+            if (!plan && mongoose.Types.ObjectId.isValid(planId)) {
+                plan = await PanelPackage.findById(planId);
+            }
+        }
+        if (!plan) {
+            plan = await PanelPackage.findOne({ planId: 'panel_12m' }) || await PanelPackage.findOne().sort({ panelDays: -1 });
+        }
+        if (plan) {
+            return {
+                id: plan.planId,
+                planId: plan.planId,
+                name: plan.name,
+                description: plan.description,
+                basePrice: plan.basePrice,
+                gstPercent: plan.gstPercent,
+                totalPrice: plan.totalPrice,
+                panelDays: plan.panelDays,
+            };
+        }
+    } catch (err) {
+        console.error('Error fetching package by ID from DB:', err);
+    }
+    // Hardcoded fallback for absolute safety if DB is unavailable
+    return { id: 'panel_12m', planId: 'panel_12m', name: '12 Month Access', description: '12 months full panel access', basePrice: Math.round(14999 / 1.18), gstPercent: 18, totalPrice: 14999, panelDays: 365 };
+}
 
 const conversationSchema = new mongoose.Schema({
     tenantId: { type: String, required: true },
@@ -141,6 +195,8 @@ const messageSchema = new mongoose.Schema({
     templateBody: { type: String },          // resolved body text of the template
     interactivePayload: { type: mongoose.Schema.Types.Mixed }, // { type, title, id }
     wamid: { type: String },                 // WhatsApp message ID from Meta
+    contextMessageId: { type: String },      // WhatsApp message ID of the replied-to message (if any)
+    replyContextPreview: { type: String, default: null }, // Snapshot of replied-to message text/preview
     status: { type: String, default: 'sent' }, // 'sent' | 'delivered' | 'read' | 'failed'
     errorDetails: { type: String },         // Why message failed
     source: { type: String, default: null }, // 'chatbot' | 'chatbot_reply' | 'chatbot_trigger' | null (null = live chat)
@@ -204,6 +260,7 @@ const recipientSchema = new mongoose.Schema({
     campaignId: String,
     wamid: { type: String, unique: true },
     to: String,
+    name: { type: String, default: null },   // client name captured at send time
     status: { type: String, default: 'sent' },
     sentAt: String,
     deliveredAt: String,
@@ -219,6 +276,7 @@ const recipientSchema = new mongoose.Schema({
 });
 recipientSchema.index({ campaignId: 1, phaseNumber: 1 });
 recipientSchema.index({ campaignId: 1, status: 1 });
+recipientSchema.index({ campaignId: 1, phaseNumber: 1, status: 1, 'retryHistory.phaseNumber': 1 });
 const Recipient = mongoose.model('Recipient', recipientSchema);
 
 const retryConfigurationSchema = new mongoose.Schema({
@@ -683,9 +741,23 @@ process.on('uncaughtException', (err) => console.error(' Uncaught Exception:', e
 
 //  App Setup 
 const app = express();
-app.use(cors());
+
+// Enable CORS for web clients (https://app.sendzyy.com, etc.) including preflight OPTIONS requests
+const corsOptions = {
+    origin: function (origin, callback) {
+        // Allow all origins (including app.sendzyy.com) with credentials
+        callback(null, true);
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'tenant-id'],
+    credentials: true,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
 const httpServer = http.createServer(app);
-const io = new Server(httpServer, { cors: { origin: '*' } });
+const io = new Server(httpServer, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 SocketEmitter.setIo(io);
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.raw({
@@ -1472,12 +1544,13 @@ app.post('/create-panel-order-register', async (req, res) => {
         return res.status(401).json({ error: 'Registration token expired or invalid. Please register again.' });
     }
     if (!razorpay) return res.status(500).json({ error: 'Payment gateway not configured' });
-    const plan = getPlanById(planId);
+    const plan = await getPlanById(planId);
     try {
         const order = await razorpay.orders.create({
             amount: plan.totalPrice * 100,
             currency: 'INR',
             receipt: `reg_${Date.now()}`,
+            payment_capture: 1, // Auto-capture: no manual capture needed on Razorpay dashboard
             notes: { email: regData.email, panelDays: plan.panelDays, planId: plan.id }
         });
         res.json({ ...order, panelDays: plan.panelDays, price: plan.totalPrice, planId: plan.id });
@@ -1497,7 +1570,7 @@ app.post('/verify-panel-payment-register', async (req, res) => {
     } catch (e) {
         return res.status(401).json({ error: 'Registration token expired. Please register again.' });
     }
-    const plan = getPlanById(planId);
+    const plan = await getPlanById(planId);
     try {
         const expectedSignature = crypto
             .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
@@ -1523,7 +1596,8 @@ app.post('/verify-panel-payment-register', async (req, res) => {
                 expiryDate: panelExpiresAt,
                 lastPaymentId: razorpay_payment_id,
                 lastPaymentDate: now,
-            }
+            },
+            status: 'active',
         });
 
         sendCredentialsEmail(regData.email, '(your chosen password)', regData.name);
@@ -1556,6 +1630,14 @@ app.post('/login', async (req, res) => {
 
         const isMatch = await bcrypt.compare(password, tenant.password);
         if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
+
+        // Block login if account status is inactive
+        if (tenant.status === 'inactive') {
+            return res.status(403).json({
+                error: 'account_inactive',
+                message: 'Your account is inactive. Please contact support.',
+            });
+        }
 
         // Block login if no paid plan has ever been activated
         const planId = tenant.subscription?.planId;
@@ -1591,6 +1673,7 @@ app.post('/login', async (req, res) => {
                 id: tenant._id.toString(),
                 name: tenant.name,
                 email: tenant.email,
+                status: tenant.status || 'active',
                 subscription: tenant.subscription,
                 whatsappConfig: tenant.whatsappConfig,
             }
@@ -1601,27 +1684,34 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// Panel plans - returns all available plans
-app.get('/panel-plans', (req, res) => {
-    res.json(PANEL_PLANS.map(p => ({
-        id: p.id,
-        name: p.name,
-        description: p.description,
-        basePrice: p.basePrice,
-        gstPercent: p.gstPercent,
-        totalPrice: p.totalPrice,
-        panelDays: p.panelDays,
-    })));
+// Panel plans - returns all available plans from DB table
+app.get('/panel-plans', async (req, res) => {
+    try {
+        const packages = await PanelPackage.find({ isActive: { $ne: false } }).sort({ panelDays: 1 });
+        res.json(packages.map(p => ({
+            id: p.planId,
+            name: p.name,
+            description: p.description,
+            basePrice: p.basePrice,
+            gstPercent: p.gstPercent,
+            totalPrice: p.totalPrice,
+            panelDays: p.panelDays,
+        })));
+    } catch (error) {
+        console.error('Error fetching panel packages:', error);
+        res.status(500).json({ error: 'Failed to fetch panel packages' });
+    }
 });
 // Create panel order for authenticated renewal
 app.post('/create-panel-order', authenticate, async (req, res) => {
     if (!razorpay) return res.status(500).json({ error: 'Payment gateway not configured' });
-    const plan = getPlanById(req.body.planId);
+    const plan = await getPlanById(req.body.planId);
     try {
         const order = await razorpay.orders.create({
             amount: plan.totalPrice * 100,
             currency: 'INR',
             receipt: `panel_${Date.now()}`,
+            payment_capture: 1, // Auto-capture: no manual capture needed on Razorpay dashboard
             notes: { tenantId: req.user.tenantId, panelDays: plan.panelDays, planId: plan.id }
         });
         res.json({ ...order, panelDays: plan.panelDays, price: plan.totalPrice, planId: plan.id });
@@ -1639,12 +1729,13 @@ app.post('/create-panel-order-renew', async (req, res) => {
     const valid = await bcrypt.compare(password, tenant.password);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
     if (!razorpay) return res.status(500).json({ error: 'Payment gateway not configured' });
-    const plan = getPlanById(planId);
+    const plan = await getPlanById(planId);
     try {
         const order = await razorpay.orders.create({
             amount: plan.totalPrice * 100,
             currency: 'INR',
             receipt: `renew_${Date.now()}`,
+            payment_capture: 1, // Auto-capture: no manual capture needed on Razorpay dashboard
             notes: { tenantId: tenant._id.toString(), panelDays: plan.panelDays, planId: plan.id }
         });
         res.json({ ...order, panelDays: plan.panelDays, price: plan.totalPrice, planId: plan.id });
@@ -1661,7 +1752,7 @@ app.post('/verify-panel-payment-renew', async (req, res) => {
     if (!tenant) return res.status(401).json({ error: 'Invalid credentials' });
     const valid = await bcrypt.compare(password, tenant.password);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-    const plan = getPlanById(planId);
+    const plan = await getPlanById(planId);
     try {
         const expectedSignature = crypto
             .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
@@ -1699,7 +1790,7 @@ app.post('/verify-panel-payment-renew', async (req, res) => {
 app.post('/verify-panel-payment', authenticate, async (req, res) => {
     const { planId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
     const tenantId = req.user.tenantId;
-    const plan = getPlanById(planId);
+    const plan = await getPlanById(planId);
     try {
         const expectedSignature = crypto
             .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
@@ -1911,6 +2002,7 @@ app.get('/me', authenticate, async (req, res) => {
             id: tenant._id.toString(),
             name: tenant.name,
             email: tenant.email,
+            status: tenant.status || 'active',
             createdAt: tenant.createdAt,
             subscription: {
                 ...tenant.subscription.toObject(),
@@ -1944,6 +2036,61 @@ app.post('/update-config', authenticate, async (req, res) => {
         res.status(500).json({ error: 'Failed to update configuration' });
     }
 });
+
+// ── PATCH /api/tenant/status & PATCH /api/tenant/:id/status ───────────────────
+// Update tenant status ('active' / 'inactive')
+const updateTenantStatusHandler = async (req, res) => {
+    try {
+        const { status, tenantId: bodyTenantId } = req.body;
+        const targetId = req.params.id || bodyTenantId || req.user?.tenantId;
+
+        if (!targetId) {
+            return res.status(400).json({ error: 'tenantId is required' });
+        }
+
+        if (!status || !['active', 'inactive'].includes(status)) {
+            return res.status(400).json({ error: "status must be 'active' or 'inactive'" });
+        }
+
+        const updatedTenant = await Tenant.findByIdAndUpdate(
+            targetId,
+            { $set: { status } },
+            { new: true }
+        );
+
+        if (!updatedTenant) {
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+
+        res.json({
+            success: true,
+            message: `Tenant status updated to ${status}`,
+            tenant: {
+                id: updatedTenant._id.toString(),
+                name: updatedTenant.name,
+                email: updatedTenant.email,
+                status: updatedTenant.status,
+                subscription: updatedTenant.subscription,
+                whatsappConfig: updatedTenant.whatsappConfig,
+                createdAt: updatedTenant.createdAt,
+                updatedAt: updatedTenant.updatedAt,
+            }
+        });
+    } catch (error) {
+        console.error('Error updating tenant status:', error);
+        res.status(500).json({ error: 'Failed to update tenant status', details: error.message });
+    }
+};
+
+app.patch('/api/tenant/status', (req, res, next) => {
+    if (req.headers['authorization'] || req.query.token) {
+        return authenticate(req, res, () => updateTenantStatusHandler(req, res));
+    }
+    updateTenantStatusHandler(req, res);
+});
+// NOTE: /api/tenant/:id/status and /api/tenants/:id/status are now registered in the Super Admin module
+// with authenticateSuperAdmin middleware for proper access control.
+
 
 
 
@@ -2704,7 +2851,7 @@ app.delete('/api/chatbots/:id', authenticate, async (req, res) => {
 
 //  Send Message 
 app.post('/send-message', authenticate, async (req, res) => {
-    const { to, type, template, text, mediaId, mediaType, campaignId } = req.body;
+    const { to, type, template, text, mediaId, mediaType, campaignId, recipientName, replyToMessageId, replyToWamid } = req.body;
     const tenantId = req.user.tenantId;
     try {
         const tenant = await Tenant.findById(tenantId);
@@ -2716,6 +2863,31 @@ app.post('/send-message', authenticate, async (req, res) => {
 
         // Build payload
         const payload = { messaging_product: 'whatsapp', to, type: type || 'template' };
+        let targetWamid = (replyToWamid && typeof replyToWamid === 'string' && replyToWamid.startsWith('wamid.'))
+            ? replyToWamid
+            : ((replyToMessageId && typeof replyToMessageId === 'string' && replyToMessageId.startsWith('wamid.')) ? replyToMessageId : null);
+
+        let replyContextPreview = null;
+        if (replyToMessageId || targetWamid) {
+            try {
+                const query = targetWamid
+                    ? { wamid: targetWamid }
+                    : (mongoose.Types.ObjectId.isValid(replyToMessageId) ? { _id: replyToMessageId } : { wamid: replyToMessageId });
+                const parentMsg = await Message.findOne(query).lean();
+                if (parentMsg) {
+                    if (!targetWamid && parentMsg.wamid && typeof parentMsg.wamid === 'string' && parentMsg.wamid.startsWith('wamid.')) {
+                        targetWamid = parentMsg.wamid;
+                    }
+                    replyContextPreview = parentMsg.text || parentMsg.templateBody || (parentMsg.templateName ? `📋 ${parentMsg.templateName}` : null) || (parentMsg.messageType ? `[${parentMsg.messageType}]` : null);
+                }
+            } catch (err) {
+                console.error(' Error resolving reply context:', err.message);
+            }
+        }
+
+        if (targetWamid) {
+            payload.context = { message_id: targetWamid };
+        }
         if (type === 'text') {
             payload.text = { body: text };
         } else if (type === 'template') {
@@ -2802,6 +2974,7 @@ app.post('/send-message', authenticate, async (req, res) => {
                         tenantId,
                         campaignId,
                         to,
+                        ...(recipientName ? { name: recipientName } : {}),
                         status: 'sent',
                         sentAt: new Date().toISOString(),
                         phaseNumber: null,
@@ -2872,6 +3045,8 @@ app.post('/send-message', authenticate, async (req, res) => {
                 templateBody: outboundTemplateBody,
                 mediaUrl: ['image', 'video', 'audio', 'document'].includes(type) ? mediaId : null,
                 wamid: wamid || null,
+                contextMessageId: targetWamid || replyToWamid || replyToMessageId || null,
+                replyContextPreview: replyContextPreview || null,
                 status: 'sent',
             });
             await broadcastConversations(tenantId);
@@ -2883,7 +3058,8 @@ app.post('/send-message', authenticate, async (req, res) => {
         res.json({ success: true, wamid });
     } catch (error) {
         console.error(' Send Message Error:', error.response?.data || error.message);
-        res.status(500).json({ error: 'Failed to send message' });
+        const detailedError = error.response?.data?.error?.message || error.response?.data?.error || error.message || 'Failed to send message';
+        res.status(error.response?.status || 500).json({ error: detailedError });
     }
 });
 
@@ -3476,6 +3652,8 @@ app.get('/conversations/:contactId/messages', authenticate, async (req, res) => 
             mediaUrl: m.mediaUrl || null,
             interactivePayload: m.interactivePayload || null,
             wamid: m.wamid || null,
+            contextMessageId: m.contextMessageId || null,
+            replyContextPreview: m.replyContextPreview || null,
             status: m.status || 'sent',
             errorDetails: m.errorDetails || null,
             source: m.source || null,
@@ -4994,6 +5172,8 @@ async function saveChatbotMessageToDB({
     wamid = null,
     previewText,
     name = null,
+    contextMessageId = null,
+    replyContextPreview = null,
 }) {
     const now = new Date();
 
@@ -5014,6 +5194,8 @@ async function saveChatbotMessageToDB({
         templateName,
         templateBody,
         wamid,
+        contextMessageId,
+        replyContextPreview,
         status: isMe ? 'sent' : undefined,
     });
 
@@ -5348,6 +5530,7 @@ async function handleQuickReplyNode(session, node, tenant, from) {
     }
     try {
         // ── Step 1: Send via WhatsApp API ────────────────────────────────────
+        
         const _qrResp = await axios.post(
             `${WHATSAPP_API_URL}/${phoneNumberId}/messages`,
             {
@@ -6103,6 +6286,25 @@ async function handleLiveChat(tenantId, message, profileName, from) {
 
     console.log(` [Tenant: ${tenantId}] Incoming from ${from} (${profileName}): ${lastMessagePreview}`);
 
+    // Lookup parent message preview if message is a reply
+    let replyContextPreview = null;
+    const contextWamid = message.context?.id || null;
+    if (contextWamid) {
+        try {
+            const parentMsg = await Message.findOne({
+                $or: [
+                    { wamid: contextWamid },
+                    ...(mongoose.Types.ObjectId.isValid(contextWamid) ? [{ _id: contextWamid }] : [])
+                ]
+            }).lean();
+            if (parentMsg) {
+                replyContextPreview = parentMsg.text || parentMsg.templateBody || (parentMsg.templateName ? `📋 ${parentMsg.templateName}` : null) || (parentMsg.messageType ? `[${parentMsg.messageType}]` : null);
+            }
+        } catch (err) {
+            console.error('[Webhook] Error finding parent message for context:', err.message);
+        }
+    }
+
     await Conversation.findOneAndUpdate(
         { tenantId, contactId: from },
         { name: profileName, lastMessage: lastMessagePreview, lastActive: new Date(), hasReply: true },
@@ -6117,6 +6319,9 @@ async function handleLiveChat(tenantId, message, profileName, from) {
         messageType: msgType,
         mediaUrl,
         interactivePayload,
+        wamid: message.id || null,
+        contextMessageId: contextWamid,
+        replyContextPreview: replyContextPreview || null,
     });
     await broadcastConversations(tenantId);
     await broadcastMessages(tenantId, from);
@@ -6494,6 +6699,9 @@ io.on('connection', (socket) => {
                     templateBody: m.templateBody || null,
                     mediaUrl: m.mediaUrl || null,
                     interactivePayload: m.interactivePayload || null,
+                    wamid: m.wamid || null,
+                    contextMessageId: m.contextMessageId || null,
+                    replyContextPreview: m.replyContextPreview || null,
                 };
             });
             socket.emit('messages_' + contactId, formatted);
@@ -6540,6 +6748,8 @@ async function broadcastMessages(tenantId, contactId) {
                 mediaUrl: m.mediaUrl || null,
                 interactivePayload: m.interactivePayload || null,
                 wamid: m.wamid || null,
+                contextMessageId: m.contextMessageId || null,
+                replyContextPreview: m.replyContextPreview || null,
                 status: m.status || 'sent',
                 errorDetails: m.errorDetails || null,
                 source: m.source || null,
@@ -6568,17 +6778,25 @@ async function broadcastCampaigns(tenantId) {
 async function runScheduledCampaigns() {
     try {
         const now = new Date();
-        const due = await ScheduledCampaign.find({ status: 'pending', scheduledAt: { $lte: now } });
+        const fiveMinsAgo = new Date(Date.now() - 5 * 60 * 1000);
+        // Pick up pending due campaigns AND stalled running campaigns (no update in 5 mins due to server restart/crash)
+        const due = await ScheduledCampaign.find({
+            $or: [
+                { status: 'pending', scheduledAt: { $lte: now } },
+                { status: 'running', updatedAt: { $lt: fiveMinsAgo } }
+            ]
+        });
+
         for (const sc of due) {
-            await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'running' } });
+            await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'running', updatedAt: new Date() } });
             const tenant = await Tenant.findById(sc.tenantId);
             if (!tenant) {
-                await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'failed', errorMessage: 'Tenant not found' } });
+                await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'failed', errorMessage: 'Tenant not found', updatedAt: new Date() } });
                 continue;
             }
             const config = tenant.whatsappConfig;
             if (!config?.accessToken || !config?.phoneNumberId) {
-                await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'failed', errorMessage: 'WhatsApp not configured' } });
+                await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'failed', errorMessage: 'WhatsApp not configured', updatedAt: new Date() } });
                 continue;
             }
             const campaignId = `sched_${sc._id}`;
@@ -6607,141 +6825,183 @@ async function runScheduledCampaigns() {
                 console.error(`[ScheduledCampaign] Failed to fetch template components: ${err.message}`);
             }
 
-            // Create initial Campaign document so it appears in reporting immediately
-            await Campaign.create({
-                tenantId: sc.tenantId,
-                id: campaignId,
-                template: sc.template,
-                timestamp: sc.scheduledAt || new Date(),
-                dispatchedAt: new Date(),
-                totalCount: sc.recipients.length,
-                successCount: 0,
-                failureCount: 0,
-                ...lifecycleFields
+            // Ensure initial Campaign document exists
+            let campaignDoc = await Campaign.findOne({ id: campaignId, tenantId: sc.tenantId });
+            if (!campaignDoc) {
+                await Campaign.create({
+                    tenantId: sc.tenantId,
+                    id: campaignId,
+                    template: sc.template,
+                    timestamp: sc.scheduledAt || new Date(),
+                    dispatchedAt: new Date(),
+                    totalCount: sc.recipients.length,
+                    successCount: 0,
+                    failureCount: 0,
+                    ...lifecycleFields
+                });
+            }
+
+            // Check existing Recipient records for resumption/deduplication
+            const existingRecipients = await Recipient.find({ campaignId, tenantId: sc.tenantId }).select('to status').lean();
+            const processedNumbers = new Set(existingRecipients.map(r => r.to));
+            let success = existingRecipients.filter(r => r.status === 'sent' || r.status === 'delivered' || r.status === 'read').length;
+            let failure = existingRecipients.filter(r => r.status === 'failed').length;
+
+            const remainingRecipients = sc.recipients.filter(r => {
+                const to = r.mobileNumber || r.to;
+                return to && !processedNumbers.has(to);
             });
 
-            let success = 0, failure = 0;
-            for (const recipient of sc.recipients) {
-                const to = recipient.mobileNumber || recipient.to;
-                if (!to) {
-                    failure++;
-                    continue;
-                }
-                try {
-                    const components = [];
-                    if (sc.mediaId && sc.mediaType) {
-                        components.push({ type: 'header', parameters: [{ type: sc.mediaType.toLowerCase(), [sc.mediaType.toLowerCase()]: { id: sc.mediaId } }] });
-                    }
-                    const vars = recipient.variables || {};
-                    const bodyParams = Object.keys(vars).sort().map(k => ({ type: 'text', text: vars[k] }));
-                    if (bodyParams.length) components.push({ type: 'body', parameters: bodyParams });
-                    const payload = {
-                        messaging_product: 'whatsapp', to, type: 'template',
-                        template: { name: sc.template, language: { code: sc.language || 'en_US' }, ...(components.length ? { components } : {}) }
-                    };
-                    const resp = await axios.post(`${WHATSAPP_API_URL}/${config.phoneNumberId}/messages`, payload, {
-                        headers: { Authorization: `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' }
-                    });
-                    const wamid = resp.data?.messages?.[0]?.id;
-                    if (wamid) {
-                        success++;
-                        // Persist Recipient document
-                        await Recipient.create({
-                            tenantId: sc.tenantId,
-                            campaignId,
-                            wamid,
-                            to,
-                            status: 'sent',
-                            sentAt: new Date().toISOString(),
-                            phaseNumber: null,
-                            retryHistory: []
-                        });
-                        // Persist StatusMapping for webhook delivery tracking
-                        await StatusMapping.findOneAndUpdate(
-                            { wamid },
-                            { wamid, tenantId: sc.tenantId, campaignId, to },
-                            { upsert: true }
-                        );
+            console.log(`[ScheduledCampaign] Starting/Resuming ${sc._id}: ${processedNumbers.size} already processed, ${remainingRecipients.length} remaining.`);
 
-                        // Log outbound template message so it appears in the conversation/chat screen
-                        try {
-                            const previewText = buildPreview('template', {
-                                templateName: sc.template,
-                                templateBody: templateBodyText,
-                            });
+            // Process remaining recipients in batches of 10 concurrent HTTP requests with bulk DB writes
+            const BATCH_SIZE = 10;
+            for (let i = 0; i < remainingRecipients.length; i += BATCH_SIZE) {
+                const chunk = remainingRecipients.slice(i, i + BATCH_SIZE);
+                const recipientDocs = [];
+                const statusMappingOps = [];
+                const conversationOps = [];
+                const messageDocs = [];
 
-                            await Conversation.findOneAndUpdate(
-                                { tenantId: sc.tenantId, contactId: to },
-                                {
-                                    name: to,
-                                    lastMessage: previewText,
-                                    lastActive: new Date(),
-                                    $setOnInsert: { hasReply: false }
-                                },
-                                { upsert: true }
-                            );
-
-                            await Message.create({
-                                tenantId: sc.tenantId,
-                                contactId: to,
-                                text: templateBodyText || `📋 Template: ${sc.template}`,
-                                isMe: true,
-                                time: new Date().toISOString(),
-                                messageType: 'template',
-                                templateName: sc.template,
-                                templateBody: templateBodyText,
-                                wamid: wamid,
-                                status: 'sent',
-                            });
-
-                            await broadcastConversations(sc.tenantId);
-                            await broadcastMessages(sc.tenantId, to);
-                        } catch (msgErr) {
-                            console.error(`[ScheduledCampaign] Failed to create Message/Conversation log for ${to}:`, msgErr.message);
-                        }
-                    } else {
+                await Promise.all(chunk.map(async (recipient) => {
+                    const to = recipient.mobileNumber || recipient.to;
+                    if (!to) {
                         failure++;
-                        await Recipient.create({
+                        return;
+                    }
+                    try {
+                        const components = [];
+                        if (sc.mediaId && sc.mediaType) {
+                            components.push({ type: 'header', parameters: [{ type: sc.mediaType.toLowerCase(), [sc.mediaType.toLowerCase()]: { id: sc.mediaId } }] });
+                        } else if (recipient.headerVariables && typeof recipient.headerVariables === 'object') {
+                            const headerVars = recipient.headerVariables;
+                            const sortedHeaderKeys = Object.keys(headerVars).sort((a, b) => Number(a) - Number(b));
+                            const headerParams = sortedHeaderKeys.map(k => ({ type: 'text', text: String(headerVars[k]) }));
+                            if (headerParams.length) components.push({ type: 'header', parameters: headerParams });
+                        }
+
+                        const vars = recipient.variables || {};
+                        const bodyParams = Object.keys(vars).sort((a, b) => Number(a) - Number(b)).map(k => ({ type: 'text', text: String(vars[k]) }));
+                        if (bodyParams.length) components.push({ type: 'body', parameters: bodyParams });
+
+                        const payload = {
+                            messaging_product: 'whatsapp', to, type: 'template',
+                            template: { name: sc.template, language: { code: sc.language || 'en_US' }, ...(components.length ? { components } : {}) }
+                        };
+                        const resp = await axios.post(`${WHATSAPP_API_URL}/${config.phoneNumberId}/messages`, payload, {
+                            headers: { Authorization: `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' }
+                        });
+                        const wamid = resp.data?.messages?.[0]?.id;
+                        if (wamid) {
+                            success++;
+                            recipientDocs.push({
+                                tenantId: sc.tenantId,
+                                campaignId,
+                                wamid,
+                                to,
+                                name: recipient.name || null,
+                                status: 'sent',
+                                sentAt: new Date().toISOString(),
+                                phaseNumber: null,
+                                retryHistory: []
+                            });
+                            statusMappingOps.push({
+                                updateOne: {
+                                    filter: { wamid },
+                                    update: { $set: { wamid, tenantId: sc.tenantId, campaignId, to } },
+                                    upsert: true
+                                }
+                            });
+
+                            try {
+                                const previewText = buildPreview('template', {
+                                    templateName: sc.template,
+                                    templateBody: templateBodyText,
+                                });
+
+                                conversationOps.push({
+                                    updateOne: {
+                                        filter: { tenantId: sc.tenantId, contactId: to },
+                                        update: {
+                                            $set: { name: to, lastMessage: previewText, lastActive: new Date() },
+                                            $setOnInsert: { hasReply: false }
+                                        },
+                                        upsert: true
+                                    }
+                                });
+
+                                messageDocs.push({
+                                    tenantId: sc.tenantId,
+                                    contactId: to,
+                                    text: templateBodyText || `📋 Template: ${sc.template}`,
+                                    isMe: true,
+                                    time: new Date().toISOString(),
+                                    messageType: 'template',
+                                    templateName: sc.template,
+                                    templateBody: templateBodyText,
+                                    wamid: wamid,
+                                    status: 'sent',
+                                });
+                            } catch (msgErr) {
+                                console.error(`[ScheduledCampaign] Failed to prepare Message/Conversation log for ${to}:`, msgErr.message);
+                            }
+                        } else {
+                            failure++;
+                            recipientDocs.push({
+                                tenantId: sc.tenantId,
+                                campaignId,
+                                wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                                to,
+                                name: recipient.name || null,
+                                status: 'failed',
+                                failedAt: new Date().toISOString(),
+                                phaseNumber: null,
+                                retryHistory: []
+                            });
+                        }
+                    } catch (sendErr) {
+                        failure++;
+                        recipientDocs.push({
                             tenantId: sc.tenantId,
                             campaignId,
                             wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
                             to,
+                            name: recipient.name || null,
                             status: 'failed',
                             failedAt: new Date().toISOString(),
                             phaseNumber: null,
                             retryHistory: []
                         });
                     }
-                } catch (sendErr) {
-                    failure++;
-                    await Recipient.create({
-                        tenantId: sc.tenantId,
-                        campaignId,
-                        wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-                        to,
-                        status: 'failed',
-                        failedAt: new Date().toISOString(),
-                        phaseNumber: null,
-                        retryHistory: []
-                    });
-                }
+                }));
+
+                // Execute bulk database operations for maximum throughput
+                const dbPromises = [];
+                if (recipientDocs.length > 0) dbPromises.push(Recipient.insertMany(recipientDocs, { ordered: false }).catch(err => console.error('[ScheduledCampaign] Bulk Recipient insert error:', err.message)));
+                if (statusMappingOps.length > 0) dbPromises.push(StatusMapping.bulkWrite(statusMappingOps, { ordered: false }).catch(err => console.error('[ScheduledCampaign] Bulk StatusMapping write error:', err.message)));
+                if (conversationOps.length > 0) dbPromises.push(Conversation.bulkWrite(conversationOps, { ordered: false }).catch(err => console.error('[ScheduledCampaign] Bulk Conversation write error:', err.message)));
+                if (messageDocs.length > 0) dbPromises.push(Message.insertMany(messageDocs, { ordered: false }).catch(err => console.error('[ScheduledCampaign] Bulk Message insert error:', err.message)));
+                await Promise.all(dbPromises);
+
+                // Periodically update DB progress & timestamp so stalled recovery won't re-trigger and dashboard updates live
+                await ScheduledCampaign.updateOne(
+                    { _id: sc._id },
+                    { $set: { updatedAt: new Date(), successCount: success, failureCount: failure } }
+                );
+                await Campaign.updateOne(
+                    { id: campaignId },
+                    { $set: { successCount: success, failureCount: failure } }
+                );
+                await broadcastCampaigns(sc.tenantId);
             }
 
             // Update Campaign final counts
             await Campaign.updateOne(
                 { id: campaignId },
-                {
-                    $set: {
-                        successCount: success,
-                        failureCount: failure
-                    }
-                }
+                { $set: { successCount: success, failureCount: failure } }
             );
 
             // ── Trigger retry system (mirrors normal campaign behaviour) ────────────
-            // Schedule phase 1 (grace-period evaluation) so the RetryScheduler cron
-            // can pick up failed/undelivered messages after the configured interval.
-            // Returns null (no-op) when the campaign has zero retry phases configured.
             try {
                 const scheduledPhase = await retryScheduler.schedulePhase(
                     campaignId,
@@ -6767,7 +7027,6 @@ async function runScheduledCampaigns() {
                     }));
                 }
             } catch (retryErr) {
-                // Non-fatal: log the error but do not prevent the scheduled job from completing
                 console.error(JSON.stringify({
                     service: 'ScheduledCampaign',
                     event: 'retry_phase1_schedule_error',
@@ -6778,10 +7037,8 @@ async function runScheduledCampaigns() {
                 }));
             }
 
-            // Emit progress updates to active dashboard rooms
             await broadcastCampaigns(sc.tenantId);
-
-            await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'completed', resultCampaignId: campaignId, successCount: success, failureCount: failure } });
+            await ScheduledCampaign.updateOne({ _id: sc._id }, { $set: { status: 'completed', resultCampaignId: campaignId, successCount: success, failureCount: failure, updatedAt: new Date() } });
             console.log(` Scheduled campaign ${sc._id} completed: ${success} sent, ${failure} failed`);
         }
     } catch (err) {
@@ -6789,6 +7046,7 @@ async function runScheduledCampaigns() {
     }
 }
 setInterval(runScheduledCampaigns, 60 * 1000);
+
 
 // ── Lead Trigger CRUD Routes ──────────────────────────────────────────────────────
 
@@ -7845,6 +8103,18 @@ app.get('/api/tenant/openai-key-status', authenticate, async (req, res) => {
     }
 });
 
+// GET /api/tenant/openai-key/reveal (authenticated)
+app.get('/api/tenant/openai-key/reveal', authenticate, async (req, res) => {
+    try {
+        const tenant = await Tenant.findById(req.user.tenantId);
+        if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+        res.json({ key: tenant.openaiApiKey || '' });
+    } catch (err) {
+        console.error('Error revealing OpenAI key:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // PUT /api/tenant/openai-key (authenticated)
 app.put('/api/tenant/openai-key', authenticate, async (req, res) => {
     const { apiKey } = req.body;
@@ -7864,7 +8134,7 @@ app.put('/api/tenant/openai-key', authenticate, async (req, res) => {
 
 // POST /api/ai/generate-template (authenticated)
 app.post('/api/ai/generate-template', authenticate, async (req, res) => {
-    const { prompt } = req.body;
+    const { prompt, category } = req.body;
 
     // Validate prompt
     if (!prompt || typeof prompt !== 'string' || prompt.trim() === '') {
@@ -7887,16 +8157,37 @@ app.post('/api/ai/generate-template', authenticate, async (req, res) => {
         return res.status(500).json({ error: 'Internal server error' });
     }
 
-    // Call OpenAI Chat Completions API
-    const systemPrompt = `You are a WhatsApp Business template content generator.
-Your task is to produce template content based on the user's description.
-Follow WhatsApp template content policies strictly:
-- No URLs, phone numbers, or email addresses in the body unless they are template variables.
-- No promotional language in UTILITY templates.
-- Keep the message professional and clear.
-- The header must be plain text only (no media), 60 characters or fewer.
-- The footer must be 60 characters or fewer.
+    // Build category-specific rule
+    let categoryRule = '';
+    if (category === 'UTILITY') {
+        categoryRule = `4. Category Rule (UTILITY):
+   - The message MUST be strictly transactional, informational, and direct (e.g., appointment updates, order tracking, receipts, alerts).
+   - Meta policy strictly FORBIDS promotional/sales language, discount offers, or upselling in Utility templates.`;
+    } else if (category === 'MARKETING') {
+        categoryRule = `4. Category Rule (MARKETING):
+   - The message should be engaging, promotional, and persuasive (e.g., announcements, sales, offers, product launches).
+   - Feel free to include special offers, clear calls to action, brand enthusiasm, and relevant emojis while remaining professional.`;
+    }
 
+    // Call OpenAI Chat Completions API
+    const systemPrompt = `You are an expert WhatsApp Business Meta API template content generator.
+Your task is to produce compliant WhatsApp template content based on the user's description.
+
+STRICT META COMPLIANCE RULES:
+1. Variable Rules:
+   - Preserve all variables like {{1}}, {{2}}, {{3}} exactly as given in the input. Do not remove, rename, renumber, or alter variables.
+   - All variables MUST use sequential numeric format like {{1}}, {{2}}, {{3}} (never use named variables like {{name}} or non-sequential numbers).
+   - Do NOT place variables in the Header or Footer text. Variables belong ONLY in the Body.
+   - Do NOT start or end the body text directly with a variable. Ensure natural text surrounds variables.
+2. Character Limits:
+   - Body: maximum 1024 characters.
+   - Header (optional): plain text only, maximum 60 characters.
+   - Footer (optional): plain text only, maximum 60 characters.
+3. Content & Formatting:
+   - Use WhatsApp formatting where appropriate (*bold*, _italics_).
+   - Avoid ALL CAPS spammy words or excessive punctuation (e.g. "BUY NOW!!!").
+   - No hardcoded URLs, phone numbers, or email addresses in plain text.
+${categoryRule ? `${categoryRule}\n` : ''}
 Respond with ONLY a valid JSON object in this exact format (no markdown, no extra text):
 {
   "body": "<required: the main message body>",
@@ -8213,6 +8504,639 @@ app.use((err, req, res, next) => {
     }
     next();
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SUPER ADMIN MODULE
+//  All routes prefixed /api/superadmin/*
+//  Uses a dedicated SUPERADMIN_JWT_SECRET — completely isolated from tenant JWTs
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Super Admin Auth Middleware ───────────────────────────────────────────────
+const authenticateSuperAdmin = (req, res, next) => {
+    const token = req.headers['authorization']?.split(' ')[1] || req.query.token;
+    if (!token) return res.status(401).json({ error: 'Unauthorized: No token provided' });
+    const secret = process.env.SUPERADMIN_JWT_SECRET || 'sendzyy-superadmin-secret-change-me';
+    jwt.verify(token, secret, (err, decoded) => {
+        if (err) return res.status(403).json({ error: 'Forbidden: Invalid or expired super admin token' });
+        if (decoded.role !== 'superadmin') return res.status(403).json({ error: 'Forbidden: Insufficient role' });
+        req.superAdmin = decoded;
+        next();
+    });
+};
+
+// ── POST /api/superadmin/login ────────────────────────────────────────────────
+app.post('/api/superadmin/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+
+        const adminEmail = process.env.SUPERADMIN_EMAIL;
+        const adminPasswordHash = process.env.SUPERADMIN_PASSWORD_HASH;
+
+        if (!adminEmail || !adminPasswordHash) {
+            return res.status(500).json({ error: 'Super Admin credentials not configured on server' });
+        }
+
+        if (email.toLowerCase() !== adminEmail.toLowerCase()) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const isMatch = await bcrypt.compare(password, adminPasswordHash);
+        if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
+
+        const secret = process.env.SUPERADMIN_JWT_SECRET || 'sendzyy-superadmin-secret-change-me';
+        const token = jwt.sign(
+            { role: 'superadmin', email: adminEmail },
+            secret,
+            { expiresIn: '12h' }
+        );
+
+        res.json({
+            success: true,
+            token,
+            admin: { email: adminEmail, role: 'superadmin' },
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] Login error:', err.message);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// ── GET /api/superadmin/tenants ───────────────────────────────────────────────
+// Lists all tenants with pagination, search, and status filtering
+// Note: 'expired' is a computed state (subscription.expiryDate < now), NOT a DB enum value
+app.get('/api/superadmin/tenants', authenticateSuperAdmin, async (req, res) => {
+    try {
+        const { page = 1, limit = 10, search = '', status = 'all' } = req.query;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const now = new Date();
+
+        // Build base query
+        let query = {};
+
+        // Search by name or email
+        if (search.trim()) {
+            query.$or = [
+                { name: { $regex: search.trim(), $options: 'i' } },
+                { email: { $regex: search.trim(), $options: 'i' } },
+            ];
+        }
+
+        // Status filter
+        if (status === 'active') {
+            query.status = 'active';
+            query['subscription.expiryDate'] = { $gte: now };
+        } else if (status === 'inactive') {
+            query.status = 'inactive';
+        } else if (status === 'expired') {
+            // Expired = active account but subscription has lapsed
+            query.status = 'active';
+            query['subscription.expiryDate'] = { $lt: now };
+        }
+        // 'all' → no filter
+
+        const total = await Tenant.countDocuments(query);
+        const tenants = await Tenant.find(query)
+            .select('-password -webhookSecret -openaiApiKey')
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(parseInt(limit))
+            .lean();
+
+        const formatted = tenants.map(t => {
+            const expiryDate = t.subscription?.expiryDate ? new Date(t.subscription.expiryDate) : null;
+            const isExpired = expiryDate ? now > expiryDate : false;
+            const daysRemaining = expiryDate ? Math.max(0, Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24))) : 0;
+
+            return {
+                id: t._id.toString(),
+                name: t.name,
+                email: t.email,
+                status: t.status,
+                computedStatus: isExpired && t.status === 'active' ? 'expired' : t.status,
+                subscription: {
+                    planId: t.subscription?.planId,
+                    planName: t.subscription?.planName,
+                    price: t.subscription?.price,
+                    expiryDate: t.subscription?.expiryDate,
+                    lastPaymentId: t.subscription?.lastPaymentId,
+                    isExpired,
+                    daysRemaining,
+                },
+                whatsappConfig: {
+                    verified: t.whatsappConfig?.verified || false,
+                    displayPhone: t.whatsappConfig?.displayPhone || null,
+                    phoneStatus: t.whatsappConfig?.phoneStatus || 'PENDING',
+                },
+                createdAt: t.createdAt,
+                updatedAt: t.updatedAt,
+            };
+        });
+
+        res.json({
+            success: true,
+            total,
+            page: parseInt(page),
+            totalPages: Math.ceil(total / parseInt(limit)),
+            tenants: formatted,
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] GET /tenants error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch tenants', details: err.message });
+    }
+});
+
+// ── POST /api/superadmin/tenants/register-manual ─────────────────────────────
+// Mode 1: Super Admin directly registers a tenant with offline/cash/bank payment clearance
+// Payment is confirmed by Super Admin — no Razorpay involved
+app.post('/api/superadmin/tenants/register-manual', authenticateSuperAdmin, async (req, res) => {
+    try {
+        const { name, email, password, planId, paymentReference, sendWelcomeEmail = true } = req.body;
+
+        if (!name || !email || !password || !planId) {
+            return res.status(400).json({ error: 'name, email, password, and planId are required' });
+        }
+
+        // Duplicate email guard
+        const existing = await Tenant.findOne({ email: email.toLowerCase().trim() });
+        if (existing) return res.status(400).json({ error: 'Email already registered' });
+
+        const plan = await getPlanById(planId);
+        if (!plan) return res.status(400).json({ error: 'Invalid planId' });
+
+        // Always bcrypt hash — never store plain text password
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        const now = new Date();
+        const panelExpiresAt = new Date(now.getTime() + plan.panelDays * 24 * 60 * 60 * 1000);
+
+        const tenant = await Tenant.create({
+            name: name.trim(),
+            email: email.toLowerCase().trim(),
+            password: hashedPassword,
+            subscription: {
+                planId: plan.id,
+                planName: plan.name,
+                price: plan.totalPrice,
+                expiryDate: panelExpiresAt,
+                lastPaymentId: paymentReference || `MANUAL-${Date.now()}`,
+                lastPaymentDate: now,
+            },
+            status: 'active',
+        });
+
+        // Log payment record (mark as manual/cash)
+        await PaymentRecord.create({
+            tenantId: tenant._id.toString(),
+            paymentId: paymentReference || `MANUAL-${Date.now()}`,
+            orderId: null,
+            category: 'panel_renewal',
+            description: `${plan.name} — Super Admin Manual Registration (Cash/Bank)`,
+            amount: plan.totalPrice,
+            timestamp: now,
+        });
+
+        // Send welcome credentials email with the plain-text password they provided
+        if (sendWelcomeEmail) {
+            try { sendCredentialsEmail(email, password, name); } catch (_) { }
+        }
+
+        res.status(201).json({
+            success: true,
+            message: 'Tenant registered and activated successfully.',
+            tenant: {
+                id: tenant._id.toString(),
+                name: tenant.name,
+                email: tenant.email,
+                status: tenant.status,
+                subscription: {
+                    planId: plan.id,
+                    planName: plan.name,
+                    expiryDate: panelExpiresAt,
+                },
+            },
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] register-manual error:', err.message);
+        res.status(500).json({ error: 'Failed to register tenant', details: err.message });
+    }
+});
+
+// ── POST /api/superadmin/tenants/create-payment-invite ───────────────────────
+// Mode 2: Super Admin sends payment invite — tenant pays online via Live Razorpay
+// Issues a 72-hour registration token; NO DB write until payment is verified
+app.post('/api/superadmin/tenants/create-payment-invite', authenticateSuperAdmin, async (req, res) => {
+    try {
+        const { name, email, planId } = req.body;
+        if (!name || !email || !planId) {
+            return res.status(400).json({ error: 'name, email, and planId are required' });
+        }
+
+        // Duplicate email guard — check upfront before creating invite
+        const existing = await Tenant.findOne({ email: email.toLowerCase().trim() });
+        if (existing) return res.status(400).json({ error: 'Email already registered' });
+
+        if (!razorpay) return res.status(500).json({ error: 'Payment gateway not configured' });
+
+        const plan = await getPlanById(planId);
+        if (!plan) return res.status(400).json({ error: 'Invalid planId' });
+
+        // Create Razorpay order using LIVE keys (same as self-service registration)
+        const order = await razorpay.orders.create({
+            amount: plan.totalPrice * 100,
+            currency: 'INR',
+            receipt: `invite_${Date.now()}`,
+            payment_capture: 1, // Auto-capture: no manual capture needed on Razorpay dashboard
+            notes: { email: email.toLowerCase().trim(), name: name.trim(), planId: plan.id, source: 'superadmin_invite' },
+        });
+
+        // Issue a 72-hour registration token (much more than self-service 15 min)
+        const inviteToken = jwt.sign(
+            {
+                type: 'superadmin_invite',
+                name: name.trim(),
+                email: email.toLowerCase().trim(),
+                planId: plan.id,
+                orderId: order.id,
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: '72h' }
+        );
+
+        res.json({
+            success: true,
+            message: 'Payment invite created. Share the inviteToken and orderId with the tenant.',
+            inviteToken,
+            razorpayOrder: {
+                orderId: order.id,
+                amount: plan.totalPrice,
+                currency: 'INR',
+                planName: plan.name,
+                panelDays: plan.panelDays,
+            },
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] create-payment-invite error:', err.message);
+        res.status(500).json({ error: 'Failed to create payment invite', details: err.message });
+    }
+});
+
+// ── POST /api/superadmin/tenants/verify-payment-invite ───────────────────────
+// Verifies payment for Mode 2 invite flow — uses LIVE Razorpay keys for signature
+// Creates tenant in MongoDB ONLY after successful payment verification
+app.post('/api/superadmin/tenants/verify-payment-invite', async (req, res) => {
+    try {
+        const { inviteToken, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+        if (!inviteToken || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+            return res.status(400).json({ error: 'inviteToken, razorpay_order_id, razorpay_payment_id, and razorpay_signature are required' });
+        }
+
+        // Verify and decode invite token
+        let inviteData;
+        try {
+            inviteData = jwt.verify(inviteToken, process.env.JWT_SECRET);
+            if (inviteData.type !== 'superadmin_invite') {
+                return res.status(400).json({ error: 'Invalid invite token type' });
+            }
+        } catch (e) {
+            return res.status(401).json({ error: 'Invite token expired or invalid. Request a new invite from Super Admin.' });
+        }
+
+        // Verify Razorpay payment signature using LIVE key
+        const expectedSignature = crypto
+            .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+            .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+            .digest('hex');
+
+        if (expectedSignature !== razorpay_signature) {
+            return res.status(400).json({ error: 'Invalid payment signature' });
+        }
+
+        // Final duplicate check (race condition guard)
+        const existing = await Tenant.findOne({ email: inviteData.email });
+        if (existing) return res.status(400).json({ error: 'Email already registered' });
+
+        const plan = await getPlanById(inviteData.planId);
+        const now = new Date();
+        const panelExpiresAt = new Date(now.getTime() + plan.panelDays * 24 * 60 * 60 * 1000);
+
+        // Auto-generate a secure temporary password (tenant must change on first login)
+        const tempPassword = crypto.randomBytes(8).toString('hex'); // 16 char hex
+        const hashedPassword = await bcrypt.hash(tempPassword, 10);
+
+        // NOW create the tenant in MongoDB — payment is confirmed
+        const tenant = await Tenant.create({
+            name: inviteData.name,
+            email: inviteData.email,
+            password: hashedPassword,
+            subscription: {
+                planId: plan.id,
+                planName: plan.name,
+                price: plan.totalPrice,
+                expiryDate: panelExpiresAt,
+                lastPaymentId: razorpay_payment_id,
+                lastPaymentDate: now,
+            },
+            status: 'active',
+        });
+
+        // Log payment record
+        await PaymentRecord.create({
+            tenantId: tenant._id.toString(),
+            paymentId: razorpay_payment_id,
+            orderId: razorpay_order_id,
+            category: 'panel_renewal',
+            description: `${plan.name} — Super Admin Invite Registration`,
+            amount: plan.totalPrice,
+            timestamp: now,
+        });
+
+        // Send welcome email with auto-generated temporary password
+        try {
+            sendCredentialsEmail(inviteData.email, tempPassword, inviteData.name);
+            sendInvoiceEmail(inviteData.email, inviteData.name, razorpay_payment_id, { name: plan.name, credits: 0, price: plan.totalPrice }, plan.totalPrice);
+        } catch (_) { }
+
+        res.json({
+            success: true,
+            message: 'Account created successfully. Login credentials have been emailed.',
+            tenant: {
+                id: tenant._id.toString(),
+                name: tenant.name,
+                email: tenant.email,
+                status: tenant.status,
+                subscription: { planId: plan.id, planName: plan.name, expiryDate: panelExpiresAt },
+            },
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] verify-payment-invite error:', err.message);
+        res.status(500).json({ error: 'Failed to complete tenant registration', details: err.message });
+    }
+});
+
+// ── PATCH /api/superadmin/tenants/:id/status ─────────────────────────────────
+// Toggle tenant active/inactive — login is blocked immediately for inactive tenants
+app.patch('/api/superadmin/tenants/:id/status', authenticateSuperAdmin, async (req, res) => {
+    try {
+        const { status } = req.body;
+        const { id } = req.params;
+
+        if (!id) return res.status(400).json({ error: 'tenantId is required' });
+        if (!status || !['active', 'inactive'].includes(status)) {
+            return res.status(400).json({ error: "status must be 'active' or 'inactive'" });
+        }
+
+        const updated = await Tenant.findByIdAndUpdate(
+            id,
+            { $set: { status } },
+            { new: true }
+        ).select('-password -webhookSecret -openaiApiKey');
+
+        if (!updated) return res.status(404).json({ error: 'Tenant not found' });
+
+        res.json({
+            success: true,
+            message: `Tenant status updated to ${status}`,
+            tenant: {
+                id: updated._id.toString(),
+                name: updated.name,
+                email: updated.email,
+                status: updated.status,
+                subscription: updated.subscription,
+                updatedAt: updated.updatedAt,
+            },
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] PATCH tenant status error:', err.message);
+        res.status(500).json({ error: 'Failed to update tenant status', details: err.message });
+    }
+});
+
+// ── Secure existing unprotected tenant status routes ──────────────────────────
+// These previously had NO auth — now protected by authenticateSuperAdmin
+app.patch('/api/tenant/:id/status', authenticateSuperAdmin, async (req, res) => {
+    const { status } = req.body;
+    if (!status || !['active', 'inactive'].includes(status)) {
+        return res.status(400).json({ error: "status must be 'active' or 'inactive'" });
+    }
+    const updated = await Tenant.findByIdAndUpdate(req.params.id, { $set: { status } }, { new: true });
+    if (!updated) return res.status(404).json({ error: 'Tenant not found' });
+    res.json({ success: true, message: `Tenant status updated to ${status}`, tenant: { id: updated._id.toString(), name: updated.name, email: updated.email, status: updated.status } });
+});
+app.patch('/api/tenants/:id/status', authenticateSuperAdmin, async (req, res) => {
+    const { status } = req.body;
+    if (!status || !['active', 'inactive'].includes(status)) {
+        return res.status(400).json({ error: "status must be 'active' or 'inactive'" });
+    }
+    const updated = await Tenant.findByIdAndUpdate(req.params.id, { $set: { status } }, { new: true });
+    if (!updated) return res.status(404).json({ error: 'Tenant not found' });
+    res.json({ success: true, message: `Tenant status updated to ${status}`, tenant: { id: updated._id.toString(), name: updated.name, email: updated.email, status: updated.status } });
+});
+
+// ── GET /api/superadmin/packages ─────────────────────────────────────────────
+// Returns ALL packages (active AND inactive) for Super Admin management
+app.get('/api/superadmin/packages', authenticateSuperAdmin, async (req, res) => {
+    try {
+        const packages = await PanelPackage.find().sort({ panelDays: 1 }).lean();
+        res.json({
+            success: true,
+            packages: packages.map(p => ({
+                id: p._id.toString(),
+                planId: p.planId,
+                name: p.name,
+                description: p.description,
+                basePrice: p.basePrice,
+                gstPercent: p.gstPercent,
+                totalPrice: p.totalPrice,
+                panelDays: p.panelDays,
+                isActive: p.isActive,
+                createdAt: p.createdAt,
+                updatedAt: p.updatedAt,
+            })),
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] GET packages error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch packages', details: err.message });
+    }
+});
+
+// ── POST /api/superadmin/packages ────────────────────────────────────────────
+// Creates a new package; totalPrice auto-computed if not provided
+app.post('/api/superadmin/packages', authenticateSuperAdmin, async (req, res) => {
+    try {
+        const { planId, name, description = '', basePrice, gstPercent = 18, panelDays, isActive = true } = req.body;
+
+        if (!planId || !name || !basePrice || !panelDays) {
+            return res.status(400).json({ error: 'planId, name, basePrice, and panelDays are required' });
+        }
+
+        const existing = await PanelPackage.findOne({ planId });
+        if (existing) return res.status(400).json({ error: `Package with planId '${planId}' already exists` });
+
+        const totalPrice = Math.round(basePrice * (1 + gstPercent / 100));
+
+        const pkg = await PanelPackage.create({ planId, name, description, basePrice, gstPercent, totalPrice, panelDays, isActive });
+
+        res.status(201).json({
+            success: true,
+            message: 'Package created successfully',
+            package: {
+                id: pkg._id.toString(),
+                planId: pkg.planId,
+                name: pkg.name,
+                description: pkg.description,
+                basePrice: pkg.basePrice,
+                gstPercent: pkg.gstPercent,
+                totalPrice: pkg.totalPrice,
+                panelDays: pkg.panelDays,
+                isActive: pkg.isActive,
+                createdAt: pkg.createdAt,
+            },
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] POST packages error:', err.message);
+        res.status(500).json({ error: 'Failed to create package', details: err.message });
+    }
+});
+
+// ── PUT /api/superadmin/packages/:id ─────────────────────────────────────────
+// Edits an existing package; totalPrice is recomputed from basePrice + gstPercent
+app.put('/api/superadmin/packages/:id', authenticateSuperAdmin, async (req, res) => {
+    try {
+        const { name, description, basePrice, gstPercent, panelDays, isActive } = req.body;
+        const pkg = await PanelPackage.findById(req.params.id);
+        if (!pkg) return res.status(404).json({ error: 'Package not found' });
+
+        if (name !== undefined) pkg.name = name;
+        if (description !== undefined) pkg.description = description;
+        if (panelDays !== undefined) pkg.panelDays = panelDays;
+        if (isActive !== undefined) pkg.isActive = isActive;
+
+        // Recompute totalPrice if pricing fields change
+        if (basePrice !== undefined) pkg.basePrice = basePrice;
+        if (gstPercent !== undefined) pkg.gstPercent = gstPercent;
+        if (basePrice !== undefined || gstPercent !== undefined) {
+            pkg.totalPrice = Math.round(pkg.basePrice * (1 + pkg.gstPercent / 100));
+        }
+
+        await pkg.save();
+
+        res.json({
+            success: true,
+            message: 'Package updated successfully',
+            package: {
+                id: pkg._id.toString(),
+                planId: pkg.planId,
+                name: pkg.name,
+                description: pkg.description,
+                basePrice: pkg.basePrice,
+                gstPercent: pkg.gstPercent,
+                totalPrice: pkg.totalPrice,
+                panelDays: pkg.panelDays,
+                isActive: pkg.isActive,
+                updatedAt: pkg.updatedAt,
+            },
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] PUT packages error:', err.message);
+        res.status(500).json({ error: 'Failed to update package', details: err.message });
+    }
+});
+
+// ── DELETE /api/superadmin/packages/:id ──────────────────────────────────────
+// Hard-deletes a package from DB. Guards against deletion if active tenants use it.
+app.delete('/api/superadmin/packages/:id', authenticateSuperAdmin, async (req, res) => {
+    try {
+        const pkg = await PanelPackage.findById(req.params.id);
+        if (!pkg) return res.status(404).json({ error: 'Package not found' });
+
+        // Guard: count active tenants subscribed to this planId
+        const activeTenantCount = await Tenant.countDocuments({
+            'subscription.planId': pkg.planId,
+            status: 'active',
+        });
+
+        if (activeTenantCount > 0) {
+            return res.status(409).json({
+                error: `Cannot delete package. ${activeTenantCount} active tenant(s) are currently on this plan.`,
+                activeTenantCount,
+            });
+        }
+
+        // Hard delete — permanently removes the document from MongoDB
+        await PanelPackage.findByIdAndDelete(req.params.id);
+
+        res.json({
+            success: true,
+            message: `Package '${pkg.name}' deleted permanently.`,
+            package: {
+                id: pkg._id.toString(),
+                planId: pkg.planId,
+                name: pkg.name,
+            },
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] DELETE packages error:', err.message);
+        res.status(500).json({ error: 'Failed to delete package', details: err.message });
+    }
+});
+
+// ── GET /api/superadmin/dashboard-stats ──────────────────────────────────────
+// Returns system-wide metrics. Revenue split by source to separate manual from online payments.
+app.get('/api/superadmin/dashboard-stats', authenticateSuperAdmin, async (req, res) => {
+    try {
+        const now = new Date();
+
+        const [totalTenants, activeTenants, inactiveTenants, expiredTenants, totalPackages, allPayments] =
+            await Promise.all([
+                Tenant.countDocuments({}),
+                Tenant.countDocuments({ status: 'active', 'subscription.expiryDate': { $gte: now } }),
+                Tenant.countDocuments({ status: 'inactive' }),
+                Tenant.countDocuments({ status: 'active', 'subscription.expiryDate': { $lt: now } }),
+                PanelPackage.countDocuments({ isActive: true }),
+                PaymentRecord.find({ category: 'panel_renewal' }).select('amount description').lean(),
+            ]);
+
+        // Separate manual (cash/bank) from online Razorpay payments
+        let onlineRevenueINR = 0;
+        let manualRevenueINR = 0;
+
+        for (const rec of allPayments) {
+            const isManual = rec.description && (
+                rec.description.includes('Manual Registration') ||
+                rec.description.includes('Cash/Bank')
+            );
+            if (isManual) {
+                manualRevenueINR += rec.amount || 0;
+            } else {
+                onlineRevenueINR += rec.amount || 0;
+            }
+        }
+
+        res.json({
+            success: true,
+            stats: {
+                totalTenants,
+                activeTenants,
+                inactiveTenants,
+                expiredSubscriptions: expiredTenants,
+                totalActivePackages: totalPackages,
+                revenue: {
+                    totalINR: onlineRevenueINR + manualRevenueINR,
+                    onlinePaymentsINR: onlineRevenueINR,
+                    manualPaymentsINR: manualRevenueINR,
+                },
+            },
+        });
+    } catch (err) {
+        console.error('[SuperAdmin] dashboard-stats error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch dashboard stats', details: err.message });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  END SUPER ADMIN MODULE
+// ════════════════════════════════════════════════════════════════════════════
 
 //  Start 
 const PORT = process.env.PORT || 3000;

@@ -54,7 +54,7 @@ class CampaignExecutor {
      *
      * @param {string}   campaignId  - Unique campaign identifier
      * @param {string}   tenantId    - Tenant identifier
-     * @param {Array}    recipients  - Array of recipient objects { mobileNumber, variables? }
+     * @param {Array}    recipients  - Array of recipient objects { mobileNumber, variables?, headerVariables? }
      * @param {string}   template    - WhatsApp template name
      * @param {string}   language    - Template language code (e.g. 'en_US')
      * @param {string}   [mediaId]   - Optional media ID for header component
@@ -112,87 +112,90 @@ class CampaignExecutor {
         let failureCount = 0;
         let sentCount = 0;
 
-        for (const recipient of recipients) {
-            const to = recipient.mobileNumber || recipient.to;
-            if (!to) {
-                console.warn(JSON.stringify({
-                    service: 'CampaignExecutor',
-                    event: 'recipient_skip_missing_number',
-                    campaignId,
-                    timestamp: new Date().toISOString()
-                }));
-                failureCount++;
-                sentCount++;
-                this.socketEmitter.emitCampaignProgress(tenantId, campaignId, {
-                    sentCount,
-                    totalCount,
-                    successCount,
-                    failureCount
-                });
-                continue;
-            }
+        const BATCH_SIZE = 10;
+        for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+            const chunk = recipients.slice(i, i + BATCH_SIZE);
+            const recipientDocs = [];
+            const statusMappingOps = [];
 
-            try {
-                // Build the WhatsApp API payload
-                const payload = this._buildPayload(to, template, language, recipient.variables, mediaId, mediaType);
+            await Promise.all(chunk.map(async (recipient) => {
+                const to = recipient.mobileNumber || recipient.to;
+                if (!to) {
+                    console.warn(JSON.stringify({
+                        service: 'CampaignExecutor',
+                        event: 'recipient_skip_missing_number',
+                        campaignId,
+                        timestamp: new Date().toISOString()
+                    }));
+                    failureCount++;
+                    sentCount++;
+                    return;
+                }
 
-                // Send via WhatsApp Cloud API
-                const response = await this.axios.post(
-                    `${WHATSAPP_API_URL}/${config.phoneNumberId}/messages`,
-                    payload,
-                    { headers: { Authorization: `Bearer ${config.accessToken}` } }
-                );
-
-                const wamid = response.data?.messages?.[0]?.id;
-                if (!wamid) throw new Error('No wamid returned from WhatsApp API');
-
-                const sentAt = new Date().toISOString();
-
-                // Persist Recipient document
-                await this.Recipient.create({
-                    tenantId,
-                    campaignId,
-                    wamid,
-                    to,
-                    status: 'sent',
-                    sentAt,
-                    phaseNumber: null,
-                    retryHistory: []
-                });
-
-                // Persist wamid → campaign mapping for delivery webhooks
-                await this.StatusMapping.findOneAndUpdate(
-                    { wamid },
-                    { wamid, tenantId, campaignId, to },
-                    { upsert: true }
-                );
-
-                successCount++;
-
-                console.log(JSON.stringify({
-                    service: 'CampaignExecutor',
-                    event: 'message_sent',
-                    campaignId,
-                    to,
-                    wamid,
-                    timestamp: new Date().toISOString()
-                }));
-            } catch (sendErr) {
-                failureCount++;
-
-                console.error(JSON.stringify({
-                    service: 'CampaignExecutor',
-                    event: 'message_send_error',
-                    campaignId,
-                    to,
-                    error: sendErr.message,
-                    responseData: sendErr.response?.data || null,
-                    timestamp: new Date().toISOString()
-                }));
-
-                // Still create a failed Recipient document for retry tracking
                 try {
-                    await this.Recipient.create({
+                    // Build the WhatsApp API payload
+                    const payload = this._buildPayload(to, template, language, recipient.variables, mediaId, mediaType, recipient.headerVariables);
+
+                    // Send via WhatsApp Cloud API
+                    const response = await this.axios.post(
+                        `${WHATSAPP_API_URL}/${config.phoneNumberId}/messages`,
+                        payload,
+                        { headers: { Authorization: `Bearer ${config.accessToken}` } }
+                    );
+
+                    const wamid = response.data?.messages?.[0]?.id;
+                    if (!wamid) throw new Error('No wamid returned from WhatsApp API');
+
+                    const sentAt = new Date().toISOString();
+
+                    // Queue Recipient document for bulk insert
+                    recipientDocs.push({
+                        tenantId,
+                        campaignId,
+                        wamid,
+                        to,
+                        status: 'sent',
+                        sentAt,
+                        phaseNumber: null,
+                        retryHistory: []
+                    });
+
+                    // Queue StatusMapping for bulk write
+                    statusMappingOps.push({
+                        updateOne: {
+                            filter: { wamid },
+                            update: { $set: { wamid, tenantId, campaignId, to } },
+                            upsert: true
+                        }
+                    });
+
+                    successCount++;
+                    sentCount++;
+
+                    console.log(JSON.stringify({
+                        service: 'CampaignExecutor',
+                        event: 'message_sent',
+                        campaignId,
+                        to,
+                        wamid,
+                        timestamp: new Date().toISOString()
+                    }));
+                } catch (sendErr) {
+                    failureCount++;
+                    sentCount++;
+
+                    console.error(JSON.stringify({
+                        service: 'CampaignExecutor',
+                        event: 'message_send_error',
+                        campaignId,
+                        to,
+                        error: sendErr.message,
+                        responseData: sendErr.response?.data || null,
+                        timestamp: new Date().toISOString()
+                    }));
+
+                    // Queue failed Recipient document for bulk insert
+                    recipientDocs.push({
                         tenantId,
                         campaignId,
                         wamid: `failed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -202,21 +205,20 @@ class CampaignExecutor {
                         phaseNumber: null,
                         retryHistory: []
                     });
-                } catch (dbErr) {
-                    console.error(JSON.stringify({
-                        service: 'CampaignExecutor',
-                        event: 'recipient_create_error',
-                        campaignId,
-                        to,
-                        error: dbErr.message,
-                        timestamp: new Date().toISOString()
-                    }));
                 }
+            }));
+
+            // Execute batched DB writes for maximum throughput
+            const dbPromises = [];
+            if (recipientDocs.length > 0) {
+                dbPromises.push(this.Recipient.insertMany(recipientDocs, { ordered: false }).catch(err => console.error('[CampaignExecutor] Bulk Recipient insert error:', err.message)));
             }
+            if (statusMappingOps.length > 0) {
+                dbPromises.push(this.StatusMapping.bulkWrite(statusMappingOps, { ordered: false }).catch(err => console.error('[CampaignExecutor] Bulk StatusMapping write error:', err.message)));
+            }
+            await Promise.all(dbPromises);
 
-            sentCount++;
-
-            // Emit progress after each message (success or failure)
+            // Emit progress after each batch
             this.socketEmitter.emitCampaignProgress(tenantId, campaignId, {
                 sentCount,
                 totalCount,
@@ -276,10 +278,10 @@ class CampaignExecutor {
      * @returns {Object} WhatsApp API payload
      * @private
      */
-    _buildPayload(to, template, language, variables, mediaId, mediaType) {
+    _buildPayload(to, template, language, variables, mediaId, mediaType, headerVariables) {
         const components = [];
 
-        // Header component with media (if provided)
+        // Header component — media takes priority over text variables
         if (mediaId && mediaType) {
             const supportedTypes = ['image', 'video', 'document'];
             const type = supportedTypes.includes(mediaType) ? mediaType : 'image';
@@ -289,6 +291,19 @@ class CampaignExecutor {
                     { type, [type]: { id: mediaId } }
                 ]
             });
+        } else if (headerVariables && typeof headerVariables === 'object') {
+            // TEXT header with {{n}} variables
+            const headerVars = Array.isArray(headerVariables)
+                ? headerVariables
+                : Object.entries(headerVariables)
+                    .sort(([a], [b]) => Number(a) - Number(b))
+                    .map(([, v]) => v);
+            if (headerVars.length > 0) {
+                components.push({
+                    type: 'header',
+                    parameters: headerVars.map(v => ({ type: 'text', text: String(v) }))
+                });
+            }
         }
 
         // Body component with text variables (if provided)
