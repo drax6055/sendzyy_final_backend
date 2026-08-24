@@ -5,7 +5,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
-const bcrypt = require('bcryptjs');
+const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
@@ -236,15 +236,7 @@ const campaignSchema = new mongoose.Schema({
         failureCount: { type: Number, default: 0 },
         executedAt: { type: Date },
         completedAt: { type: Date }
-    }],
-    // Template Buttons Snapshot for tracking
-    templateButtons: [{
-        text: { type: String, required: true },
-        type: { type: String, default: 'QUICK_REPLY' }, // 'QUICK_REPLY' | 'PHONE_NUMBER' | 'URL'
-        url: { type: String, default: null },
-        phoneNumber: { type: String, default: null },
-        index: { type: Number, default: 0 }
-    }],
+    }]
 }, { timestamps: true });
 campaignSchema.index({ tenantId: 1, id: 1 }, { unique: true });
 campaignSchema.index({ tenantId: 1, status: 1 });
@@ -280,15 +272,6 @@ const recipientSchema = new mongoose.Schema({
         phaseNumber: Number,
         attemptedAt: Date,
         status: String
-    }],
-    // Button Interaction Tracking
-    clickedButtons: { type: [String], default: [] },
-    buttonClicks: [{
-        buttonText: { type: String, required: true },
-        buttonType: { type: String, default: 'QUICK_REPLY' },
-        buttonId: { type: String, default: null },
-        clickedAt: { type: Date, default: Date.now },
-        rawPayload: { type: mongoose.Schema.Types.Mixed, default: null }
     }]
 });
 recipientSchema.index({ campaignId: 1, phaseNumber: 1 });
@@ -803,7 +786,7 @@ app.get('/', (req, res) => {
     `);
 });
 
-const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'app_sendzyy_auth_token_1502200214082002';
+const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'app.sendzyy_auth$token@1502200214082002%&asdavcwrgwwvtsrfw453rtbruyntyu';
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v25.0';
 
 console.log(` Server starting at: ${new Date().toLocaleString()}`);
@@ -1875,14 +1858,11 @@ app.get('/webhook', (req, res) => {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
-    const verifyTokenInstagram = process.env.INSTAGRAM_VERIFY_TOKEN || 'app_sendzyy_auth_token_1502200214082002';
-    const verifyTokenWhatsApp = process.env.WHATSAPP_VERIFY_TOKEN || 'whatsapp_bulk_verify_token_123';
-
-    if (mode === 'subscribe' && (token === verifyTokenInstagram || token === verifyTokenWhatsApp)) {
-        console.log('Webhook verified successfully');
+    if (mode && token === VERIFY_TOKEN) {
+        console.log(' Webhook Verified!');
         return res.status(200).send(challenge);
     }
-    return res.sendStatus(403);
+    res.sendStatus(403);
 });
 
 //  Templates 
@@ -3724,13 +3704,8 @@ app.get('/media/:mediaId', authenticate, async (req, res) => {
 
 app.get('/campaigns/:campaignId/recipients', authenticate, async (req, res) => {
     try {
-        const recipients = await Recipient.find({ tenantId: req.user.tenantId, campaignId: req.params.campaignId }).lean();
-        const campaign = await Campaign.findOne({ id: req.params.campaignId, tenantId: req.user.tenantId }).lean();
-        res.json({
-            template: campaign?.template || '',
-            templateButtons: campaign?.templateButtons || [],
-            recipients: recipients
-        });
+        const recipients = await Recipient.find({ tenantId: req.user.tenantId, campaignId: req.params.campaignId });
+        res.json(recipients);
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch recipients' });
     }
@@ -5913,54 +5888,6 @@ async function handleEndNode(session, node, tenant, from) {
     }
 }
 
-// Dynamic Campaign Template Button Interaction Recording
-async function recordRecipientButtonClick(tenantId, from, buttonText, buttonType, buttonId, contextWamid, rawPayload) {
-    if (!buttonText || typeof buttonText !== 'string' || buttonText.trim() === '') return;
-    const trimmedBtn = buttonText.trim();
-    let recipient = null;
-
-    try {
-        // Strategy A: Match by contextWamid (most accurate — links directly to original message wamid)
-        if (contextWamid) {
-            recipient = await Recipient.findOne({ wamid: contextWamid });
-        }
-
-        // Strategy B: Match via StatusMapping wamid
-        if (!recipient && contextWamid) {
-            const mapping = await StatusMapping.findOne({ wamid: contextWamid });
-            if (mapping?.campaignId) {
-                recipient = await Recipient.findOne({ campaignId: mapping.campaignId, to: from });
-            }
-        }
-
-        // Strategy C: Fallback to most recent campaign sent to this phone number
-        if (!recipient && from) {
-            recipient = await Recipient.findOne({ tenantId, to: from }).sort({ _id: -1 });
-        }
-
-        if (recipient) {
-            await Recipient.updateOne(
-                { _id: recipient._id },
-                {
-                    $addToSet: { clickedButtons: trimmedBtn },
-                    $push: {
-                        buttonClicks: {
-                            buttonText: trimmedBtn,
-                            buttonType: buttonType || 'QUICK_REPLY',
-                            buttonId: buttonId || null,
-                            clickedAt: new Date(),
-                            rawPayload: rawPayload || null
-                        }
-                    }
-                }
-            );
-            console.log(`[Webhook] Recorded button click "${trimmedBtn}" for recipient ${recipient.to} in campaign ${recipient.campaignId}`);
-        }
-    } catch (err) {
-        console.error('[Webhook] Error in recordRecipientButtonClick:', err.message);
-    }
-}
-
 // Task 2.2 — main entry point
 async function chatbotEngineProcessMessage(tenantId, message, profileName, from, tenant) {
     const lockKey = `${tenantId}:${from}`;
@@ -6699,36 +6626,6 @@ app.post('/webhook', async (req, res) => {
                 const message = value.messages[0];
                 const from = message.from;
                 const profileName = value.contacts?.[0]?.profile?.name || 'Unknown Sender';
-
-                // Record Campaign button interactions in real-time
-                const msgType = message.type || 'text';
-                let buttonText = null;
-                let buttonType = 'QUICK_REPLY';
-                let buttonId = null;
-                let rawPayload = null;
-
-                if (msgType === 'button') {
-                    buttonText = message.button?.text || message.button?.payload || '';
-                    rawPayload = message.button;
-                } else if (msgType === 'interactive') {
-                    const interactive = message.interactive || {};
-                    if (interactive.type === 'button_reply') {
-                        buttonText = interactive.button_reply?.title || interactive.button_reply?.id || '';
-                        buttonId = interactive.button_reply?.id || null;
-                        rawPayload = interactive.button_reply;
-                    }
-                } else if (msgType === 'text') {
-                    buttonText = message.text?.body || '';
-                    buttonType = 'TEXT_REPLY';
-                    rawPayload = message.text;
-                }
-
-                if (buttonText && buttonText.trim() !== '') {
-                    const contextWamid = message.context?.id || null;
-                    recordRecipientButtonClick(tenantId, from, buttonText.trim(), buttonType, buttonId, contextWamid, rawPayload).catch(err => {
-                        console.error('[Webhook] Error recording button click:', err);
-                    });
-                }
 
                 await chatbotEngineProcessMessage(tenantId, message, profileName, from, tenant);
             }
