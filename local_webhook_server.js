@@ -16,7 +16,7 @@ const app = express();
 app.use(bodyParser.json());
 
 const PORT = 3000;
-const VERIFY_TOKEN = "whatsapp_bulk_verify_token_123";
+const VERIFY_TOKEN = "app.sendzyy_auth$token@1502200214082002%&asdavcwrgwwvtsrfw453rtbruyntyu";
 
 // 2. Webhook Verification (for Meta)
 app.get('/webhook', (req, res) => {

@@ -786,7 +786,7 @@ app.get('/', (req, res) => {
     `);
 });
 
-const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'whatsapp_bulk_verify_token_123';
+const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'app.sendzyy_auth$token@1502200214082002%&asdavcwrgwwvtsrfw453rtbruyntyu';
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v25.0';
 
 console.log(` Server starting at: ${new Date().toLocaleString()}`);
