@@ -5,16 +5,17 @@
  * to single devices, tenant topics, or multicast token groups.
  */
 
-const admin = require('firebase-admin');
+const { initializeApp, getApps, cert } = require('firebase-admin/app');
+const { getMessaging } = require('firebase-admin/messaging');
 const path = require('path');
 const fs = require('fs');
 
 let messagingInstance = null;
 
-function getMessaging() {
+function getMessagingClient() {
     if (messagingInstance) return messagingInstance;
 
-    if (!admin.apps.length) {
+    if (!getApps().length) {
         const serviceAccountPath = path.join(__dirname, '..', 'serviceAccountKey.json');
         if (!fs.existsSync(serviceAccountPath)) {
             console.warn('[FCMService] serviceAccountKey.json not found. FCM push notifications disabled.');
@@ -23,8 +24,8 @@ function getMessaging() {
 
         try {
             const serviceAccount = require(serviceAccountPath);
-            admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount)
+            initializeApp({
+                credential: cert(serviceAccount)
             });
             console.log('[FCMService] Firebase Admin initialized successfully.');
         } catch (err) {
@@ -33,8 +34,13 @@ function getMessaging() {
         }
     }
 
-    messagingInstance = admin.messaging();
-    return messagingInstance;
+    try {
+        messagingInstance = getMessaging();
+        return messagingInstance;
+    } catch (err) {
+        console.error('[FCMService] getMessaging failed:', err.message);
+        return null;
+    }
 }
 
 const FCMService = {
@@ -42,7 +48,7 @@ const FCMService = {
      * Send push notification to a single FCM device token
      */
     async sendToDevice(token, { title, body, data = {}, imageUrl = null }) {
-        const messaging = getMessaging();
+        const messaging = getMessagingClient();
         if (!messaging) return { success: false, reason: 'FCM not initialized' };
 
         const stringData = {};
@@ -103,7 +109,7 @@ const FCMService = {
      * Send push notification to all devices subscribed to a tenant topic
      */
     async sendToTenant(tenantId, { title, body, data = {}, imageUrl = null }) {
-        const messaging = getMessaging();
+        const messaging = getMessagingClient();
         if (!messaging) return { success: false, reason: 'FCM not initialized' };
 
         const topic = `tenant_${tenantId}`;
@@ -147,7 +153,7 @@ const FCMService = {
      * Subscribe an FCM token to a tenant topic
      */
     async subscribeToTenantTopic(tokens, tenantId) {
-        const messaging = getMessaging();
+        const messaging = getMessagingClient();
         if (!messaging) return;
         const topic = `tenant_${tenantId}`;
         const tokenList = Array.isArray(tokens) ? tokens : [tokens];
@@ -163,7 +169,7 @@ const FCMService = {
      * Unsubscribe an FCM token from a tenant topic
      */
     async unsubscribeFromTenantTopic(tokens, tenantId) {
-        const messaging = getMessaging();
+        const messaging = getMessagingClient();
         if (!messaging) return;
         const topic = `tenant_${tenantId}`;
         const tokenList = Array.isArray(tokens) ? tokens : [tokens];
