@@ -5,7 +5,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
-const bcrypt = require('bcryptjs');
+const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
@@ -2201,7 +2201,8 @@ app.get('/webhook', (req, res) => {
         return res.status(200).send(challenge);
     }
     return res.sendStatus(403);
-})
+});
+
 //  Templates 
 app.get('/fetch-templates', authenticate, async (req, res) => {
     try {
