@@ -59,9 +59,12 @@ const NotificationService = {
                 console.warn('[NotificationService] Socket emit error:', sockErr.message);
             }
 
-            // 4. Dispatch FCM Push Notification to tenant devices / topic
+            // 4. Dispatch FCM Push Notification to tenant devices (direct multicast + topic)
             try {
-                const fcmResult = await FCMService.sendToTenant(tenantId, {
+                const activeTokens = await FCMToken.find({ tenantId, isActive: true }).select('token');
+                const tokenList = activeTokens.map(t => t.token).filter(Boolean);
+
+                const pushPayload = {
                     title,
                     body,
                     imageUrl,
@@ -72,7 +75,15 @@ const NotificationService = {
                         unreadCount: String(unreadCount),
                         ...actionData
                     }
-                });
+                };
+
+                // Send direct multicast to all active tokens for instant high-priority delivery
+                if (tokenList.length > 0) {
+                    await FCMService.sendMulticast(tokenList, pushPayload);
+                }
+
+                // Also broadcast to tenant topic for multi-device coverage
+                const fcmResult = await FCMService.sendToTenant(tenantId, pushPayload);
 
                 if (fcmResult.success) {
                     notification.pushSent = true;

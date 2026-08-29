@@ -5,7 +5,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
@@ -786,7 +786,7 @@ app.get('/', (req, res) => {
     `);
 });
 
-const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'app_sendzyy_auth_token_1502200214082002';
+const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'app.sendzyy_auth$token@1502200214082002%&asdavcwrgwwvtsrfw453rtbruyntyu';
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v25.0';
 
 console.log(` Server starting at: ${new Date().toLocaleString()}`);
@@ -2158,14 +2158,11 @@ app.get('/webhook', (req, res) => {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
-    const verifyTokenInstagram = process.env.INSTAGRAM_VERIFY_TOKEN || 'app_sendzyy_auth_token_1502200214082002';
-    const verifyTokenWhatsApp = process.env.WHATSAPP_VERIFY_TOKEN || 'whatsapp_bulk_verify_token_123';
-
-    if (mode === 'subscribe' && (token === verifyTokenInstagram || token === verifyTokenWhatsApp)) {
-        console.log('Webhook verified successfully');
+    if (mode && token === VERIFY_TOKEN) {
+        console.log(' Webhook Verified!');
         return res.status(200).send(challenge);
     }
-    return res.sendStatus(403);
+    res.sendStatus(403);
 });
 
 //  Templates 

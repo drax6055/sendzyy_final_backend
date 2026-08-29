@@ -1,20 +1,14 @@
-/**
- * FCMService
- *
- * Helper service that wraps firebase-admin SDK to send push notifications
- * to single devices, tenant topics, or multicast token groups.
- */
-
-const admin = require('firebase-admin');
+const { initializeApp, getApps, cert } = require('firebase-admin/app');
+const { getMessaging } = require('firebase-admin/messaging');
 const path = require('path');
 const fs = require('fs');
 
 let messagingInstance = null;
 
-function getMessaging() {
+function getMessagingClient() {
     if (messagingInstance) return messagingInstance;
 
-    if (!admin.apps.length) {
+    if (!getApps().length) {
         const serviceAccountPath = path.join(__dirname, '..', 'serviceAccountKey.json');
         if (!fs.existsSync(serviceAccountPath)) {
             console.warn('[FCMService] serviceAccountKey.json not found. FCM push notifications disabled.');
@@ -23,8 +17,8 @@ function getMessaging() {
 
         try {
             const serviceAccount = require(serviceAccountPath);
-            admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount)
+            initializeApp({
+                credential: cert(serviceAccount)
             });
             console.log('[FCMService] Firebase Admin initialized successfully.');
         } catch (err) {
@@ -33,8 +27,68 @@ function getMessaging() {
         }
     }
 
-    messagingInstance = admin.messaging();
-    return messagingInstance;
+    try {
+        messagingInstance = getMessaging();
+        return messagingInstance;
+    } catch (err) {
+        console.error('[FCMService] getMessaging failed:', err.message);
+        return null;
+    }
+}
+
+function buildPayload({ title, body, data = {}, imageUrl = null }) {
+    const stringData = {
+        title: String(title || ''),
+        body: String(body || ''),
+        click_action: 'FLUTTER_NOTIFICATION_CLICK'
+    };
+    for (const key of Object.keys(data)) {
+        stringData[key] = String(data[key] ?? '');
+    }
+
+    return {
+        notification: {
+            title,
+            body,
+            ...(imageUrl ? { imageUrl } : {})
+        },
+        data: stringData,
+        android: {
+            priority: 'high',
+            notification: {
+                title,
+                body,
+                sound: 'default',
+                channelId: 'sendzyy_notifications',
+                priority: 'high',
+                defaultSound: true,
+                defaultVibrateTimings: true,
+                visibility: 'public',
+                clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+                ...(imageUrl ? { imageUrl } : {})
+            }
+        },
+        apns: {
+            headers: { 'apns-priority': '10' },
+            payload: {
+                aps: {
+                    alert: { title, body },
+                    sound: 'default',
+                    badge: 1,
+                    contentAvailable: true
+                }
+            }
+        },
+        webpush: {
+            headers: { Urgency: 'high' },
+            notification: {
+                title,
+                body,
+                icon: '/icons/icon-192.png',
+                ...(imageUrl ? { image: imageUrl } : {})
+            }
+        }
+    };
 }
 
 const FCMService = {
@@ -42,49 +96,13 @@ const FCMService = {
      * Send push notification to a single FCM device token
      */
     async sendToDevice(token, { title, body, data = {}, imageUrl = null }) {
-        const messaging = getMessaging();
+        const messaging = getMessagingClient();
         if (!messaging) return { success: false, reason: 'FCM not initialized' };
 
-        const stringData = {};
-        for (const key of Object.keys(data)) {
-            stringData[key] = String(data[key] ?? '');
-        }
-
+        const basePayload = buildPayload({ title, body, data, imageUrl });
         const message = {
             token,
-            notification: {
-                title,
-                body,
-                ...(imageUrl ? { imageUrl } : {})
-            },
-            data: stringData,
-            android: {
-                priority: 'high',
-                notification: {
-                    sound: 'default',
-                    channelId: 'sendzyy_notifications',
-                    ...(imageUrl ? { imageUrl } : {})
-                }
-            },
-            apns: {
-                headers: { 'apns-priority': '10' },
-                payload: {
-                    aps: {
-                        sound: 'default',
-                        badge: 1,
-                        contentAvailable: true
-                    }
-                }
-            },
-            webpush: {
-                headers: { Urgency: 'high' },
-                notification: {
-                    title,
-                    body,
-                    icon: '/icons/icon-192.png',
-                    ...(imageUrl ? { image: imageUrl } : {})
-                }
-            }
+            ...basePayload
         };
 
         try {
@@ -100,38 +118,69 @@ const FCMService = {
     },
 
     /**
+     * Send push notification to multiple device tokens directly
+     */
+    async sendMulticast(tokens, { title, body, data = {}, imageUrl = null }) {
+        const messaging = getMessagingClient();
+        if (!messaging) return { success: false, reason: 'FCM not initialized' };
+        if (!tokens || !tokens.length) return { success: true, sentCount: 0 };
+
+        const basePayload = buildPayload({ title, body, data, imageUrl });
+        const message = {
+            tokens,
+            ...basePayload
+        };
+
+        try {
+            const response = await messaging.sendEachForMulticast(message);
+            console.log(`[FCMService] Multicast result: ${response.successCount} success, ${response.failureCount} failure out of ${tokens.length} tokens`);
+
+            // Clean up invalid/expired tokens asynchronously
+            if (response.failureCount > 0) {
+                const mongoose = require('mongoose');
+                const FCMToken = mongoose.models.FCMToken;
+                if (FCMToken) {
+                    const invalidTokens = [];
+                    response.responses.forEach((resp, idx) => {
+                        if (!resp.success && resp.error) {
+                            const code = resp.error.code;
+                            if (code === 'messaging/registration-token-not-registered' || code === 'messaging/invalid-registration-token') {
+                                invalidTokens.push(tokens[idx]);
+                            }
+                        }
+                    });
+                    if (invalidTokens.length > 0) {
+                        FCMToken.deleteMany({ token: { $in: invalidTokens } }).catch(err => {
+                            console.warn('[FCMService] Error cleaning up stale tokens:', err.message);
+                        });
+                    }
+                }
+            }
+
+            return {
+                success: response.successCount > 0,
+                successCount: response.successCount,
+                failureCount: response.failureCount,
+                responses: response.responses
+            };
+        } catch (error) {
+            console.error('[FCMService] Send multicast error:', error.message);
+            return { success: false, error: error.message };
+        }
+    },
+
+    /**
      * Send push notification to all devices subscribed to a tenant topic
      */
     async sendToTenant(tenantId, { title, body, data = {}, imageUrl = null }) {
-        const messaging = getMessaging();
+        const messaging = getMessagingClient();
         if (!messaging) return { success: false, reason: 'FCM not initialized' };
 
         const topic = `tenant_${tenantId}`;
-        const stringData = {};
-        for (const key of Object.keys(data)) {
-            stringData[key] = String(data[key] ?? '');
-        }
-
+        const basePayload = buildPayload({ title, body, data, imageUrl });
         const message = {
             topic,
-            notification: {
-                title,
-                body,
-                ...(imageUrl ? { imageUrl } : {})
-            },
-            data: stringData,
-            android: {
-                priority: 'high',
-                notification: { sound: 'default', channelId: 'sendzyy_notifications' }
-            },
-            apns: {
-                headers: { 'apns-priority': '10' },
-                payload: { aps: { sound: 'default', contentAvailable: true } }
-            },
-            webpush: {
-                headers: { Urgency: 'high' },
-                notification: { title, body, icon: '/icons/icon-192.png' }
-            }
+            ...basePayload
         };
 
         try {
@@ -147,7 +196,7 @@ const FCMService = {
      * Subscribe an FCM token to a tenant topic
      */
     async subscribeToTenantTopic(tokens, tenantId) {
-        const messaging = getMessaging();
+        const messaging = getMessagingClient();
         if (!messaging) return;
         const topic = `tenant_${tenantId}`;
         const tokenList = Array.isArray(tokens) ? tokens : [tokens];
@@ -163,7 +212,7 @@ const FCMService = {
      * Unsubscribe an FCM token from a tenant topic
      */
     async unsubscribeFromTenantTopic(tokens, tenantId) {
-        const messaging = getMessaging();
+        const messaging = getMessagingClient();
         if (!messaging) return;
         const topic = `tenant_${tenantId}`;
         const tokenList = Array.isArray(tokens) ? tokens : [tokens];
@@ -177,3 +226,4 @@ const FCMService = {
 };
 
 module.exports = FCMService;
+
