@@ -1528,7 +1528,42 @@ app.get('/api/instagram/profile', authenticate, async (req, res) => {
 });
 
 
-// 5. Disconnect Instagram Profile
+// 5. Get Detailed Instagram Profile from Graph API
+app.get('/api/instagram/detailed-profile', authenticate, async (req, res) => {
+    try {
+        const tenant = await Tenant.findById(req.user.tenantId);
+        if (!tenant) {
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+
+        const config = tenant.instagramConfig;
+        if (!config?.connected || !config?.accessToken || !config?.instagramAccountId) {
+            return res.status(400).json({ error: 'Instagram not connected' });
+        }
+
+        // Use graph.instagram.com with instagram_business_basic token
+        // Fields: name, username, profile_picture_url, followers_count
+        const graphResponse = await axios.get(
+            `https://graph.instagram.com/${config.instagramAccountId}`,
+            {
+                params: {
+                    fields: 'name,username,profile_picture_url,followers_count',
+                    access_token: config.accessToken
+                }
+            }
+        );
+
+        return res.json(graphResponse.data);
+
+    } catch (error) {
+        console.error('[INSTAGRAM DETAILED PROFILE] ❌ Error:', error.response?.data || error.message);
+        const errMsg = error.response?.data?.error?.message || error.message || 'Failed to fetch detailed profile';
+        return res.status(500).json({ error: errMsg });
+    }
+});
+
+
+// 6. Disconnect Instagram Profile
 app.post('/api/instagram/disconnect', authenticate, async (req, res) => {
     try {
         const tenant =
@@ -2158,13 +2193,15 @@ app.get('/webhook', (req, res) => {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
-    if (mode && token === VERIFY_TOKEN) {
-        console.log(' Webhook Verified!');
+    const verifyTokenInstagram = process.env.INSTAGRAM_VERIFY_TOKEN || 'app_sendzyy_auth_token_1502200214082002';
+    const verifyTokenWhatsApp = process.env.WHATSAPP_VERIFY_TOKEN || 'whatsapp_bulk_verify_token_123';
+
+    if (mode === 'subscribe' && (token === verifyTokenInstagram || token === verifyTokenWhatsApp)) {
+        console.log('Webhook verified successfully');
         return res.status(200).send(challenge);
     }
-    res.sendStatus(403);
-});
-
+    return res.sendStatus(403);
+})
 //  Templates 
 app.get('/fetch-templates', authenticate, async (req, res) => {
     try {
