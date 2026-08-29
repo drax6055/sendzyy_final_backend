@@ -1091,174 +1091,459 @@ app.get('/api/instagram/auth', authenticate, (req, res) => {
     try {
         const token = req.headers['authorization']?.split(' ')[1] || req.query.token;
         const clientId = process.env.INSTAGRAM_CLIENT_ID;
-        const redirectUri = 'https://app.sendzyy.com/';
+        const redirectUri = 'https://appapi.sendzyy.com/api/instagram/callback';
         const scope = 'instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments,instagram_business_content_publish,instagram_business_manage_insights';
-        
-        // Pass the JWT token as state so we can securely retrieve the tenant ID on callback
-        const authUrl = `https://www.instagram.com/oauth/authorize?force_reauth=true&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}&state=${token}`;
-        
+        const authUrl =
+            `https://www.instagram.com/oauth/authorize` +
+            `?force_reauth=true` +
+            `&client_id=${clientId}` +
+            `&redirect_uri=${redirectUri}` +
+            `&response_type=code` +
+            `&scope=${encodeURIComponent(scope)}` +
+            `&state=${encodeURIComponent(token)}`;
+
         return res.redirect(authUrl);
     } catch (error) {
-        console.error('Error initiating Instagram Auth:', error);
-        return res.status(500).json({ error: 'Internal Server Error' });
+        console.error('[INSTAGRAM AUTH] ❌ ERROR');
+        console.error('[INSTAGRAM AUTH] Error message:', error.message);
+        console.error('[INSTAGRAM AUTH] Stack:', error.stack);
+
+        return res.status(500).json({
+            error: 'Internal Server Error'
+        });
     }
 });
 
 // 2. OAuth Callback Handler
 app.get('/api/instagram/callback', async (req, res) => {
-    const { code, state, frontend_url } = req.query;
-    
-    // Fallback to local default frontend if not passed
-    const defaultFrontend = 'https://app.sendzyy.com';
-    const targetFrontend = frontend_url || defaultFrontend;
-    
-    if (!code || !state) {
-        console.error('Instagram Callback Error: Missing code or state');
-        return res.redirect(`${targetFrontend}/#/instagram-profile-setup?error=${encodeURIComponent('Missing code or state')}`);
+    const { code, state } = req.query;
+    const targetFrontend = 'https://app.sendzyy.com';
+
+    // Check Instagram OAuth errors
+    if (req.query.error) {
+        console.error('[INSTAGRAM CALLBACK] ❌ Instagram returned an OAuth error');
+        console.error(
+            '[INSTAGRAM CALLBACK] Error:',
+            req.query.error
+        );
+        console.error(
+            '[INSTAGRAM CALLBACK] Reason:',
+            req.query.error_reason
+        );
+        console.error(
+            '[INSTAGRAM CALLBACK] Description:',
+            req.query.error_description
+        );
+
+        return res.redirect(
+            `${targetFrontend}/?error=${encodeURIComponent(
+                req.query.error_description ||
+                req.query.error ||
+                'Instagram authorization failed'
+            )}`
+        );
     }
-    
-    // Verify state (contains JWT token)
-    jwt.verify(state, process.env.JWT_SECRET, async (err, user) => {
-        if (err || !user?.tenantId) {
-            console.error('Instagram Callback Error: Invalid state token');
-            return res.redirect(`${targetFrontend}/#/instagram-profile-setup?error=${encodeURIComponent('Session expired or invalid state')}`);
-        }
-        
-        const tenantId = user.tenantId;
-        
-        try {
-            const clientId = process.env.INSTAGRAM_CLIENT_ID;
-            const clientSecret = process.env.INSTAGRAM_CLIENT_SECRET || process.env.META_APP_SECRET;
-            
-            if (!clientSecret) {
-                throw new Error('INSTAGRAM_CLIENT_SECRET or META_APP_SECRET not configured');
+
+    if (!code || !state) {
+        console.error(
+            '[INSTAGRAM CALLBACK] ❌ Missing code or state'
+        );
+        console.error(
+            '[INSTAGRAM CALLBACK] Code received:',
+            !!code
+        );
+        console.error(
+            '[INSTAGRAM CALLBACK] State received:',
+            !!state
+        );
+
+        return res.redirect(
+            `${targetFrontend}/?error=${encodeURIComponent(
+                'Missing code or state'
+            )}`
+        );
+    }
+
+    // 3. Verify JWT state
+    jwt.verify(
+        state,
+        process.env.JWT_SECRET,
+        async (err, user) => {
+            if (err) {
+                console.error(
+                    '[INSTAGRAM CALLBACK] ❌ JWT verification failed'
+                );
+                console.error(
+                    '[INSTAGRAM CALLBACK] JWT error:',
+                    err.message
+                );
+
+                return res.redirect(
+                    `${targetFrontend}/?error=${encodeURIComponent(
+                        'Invalid state token'
+                    )}`
+                );
             }
-            
-            // Exchange code for short-lived access token
-            const tokenParams = new URLSearchParams();
-            tokenParams.append('client_id', clientId);
-            tokenParams.append('client_secret', clientSecret);
-            tokenParams.append('grant_type', 'authorization_code');
-            tokenParams.append('redirect_uri', 'https://app.sendzyy.com/');
-            tokenParams.append('code', code);
-            
-            console.log('Exchanging auth code for short-lived Instagram token...');
-            const tokenResponse = await axios.post('https://api.instagram.com/oauth/access_token', tokenParams, {
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-            });
-            
-            const { access_token: shortLivedToken } = tokenResponse.data;
-            
-            // Exchange short-lived token for long-lived token
-            console.log('Exchanging short-lived token for long-lived Instagram token...');
-            const longLivedResponse = await axios.get('https://graph.instagram.com/access_token', {
-                params: {
-                    grant_type: 'ig_exchange_token',
-                    client_secret: clientSecret,
+
+            if (!user?.tenantId) {
+                console.error(
+                    '[INSTAGRAM CALLBACK] ❌ tenantId missing in JWT'
+                );
+
+                return res.redirect(
+                    `${targetFrontend}/?error=${encodeURIComponent(
+                        'Tenant ID missing'
+                    )}`
+                );
+            }
+
+            const tenantId = user.tenantId;
+
+            try {
+                // 4. Check environment variables
+                const clientId =
+                    process.env.INSTAGRAM_CLIENT_ID;
+
+                const clientSecret =
+                    process.env.INSTAGRAM_CLIENT_SECRET ||
+                    process.env.META_APP_SECRET;
+
+                if (!clientId) {
+                    throw new Error(
+                        'INSTAGRAM_CLIENT_ID is not configured'
+                    );
+                }
+
+                if (!clientSecret) {
+                    throw new Error(
+                        'INSTAGRAM_CLIENT_SECRET or META_APP_SECRET is not configured'
+                    );
+                }
+
+                // 5. Exchange code for short-lived token
+                const redirectUri =
+                    'https://appapi.sendzyy.com/api/instagram/callback';
+
+                const tokenParams = new URLSearchParams();
+                tokenParams.append(
+                    'client_id',
+                    clientId
+                );
+                tokenParams.append(
+                    'client_secret',
+                    clientSecret
+                );
+                tokenParams.append(
+                    'grant_type',
+                    'authorization_code'
+                );
+                tokenParams.append(
+                    'redirect_uri',
+                    redirectUri
+                );
+                tokenParams.append(
+                    'code',
+                    code
+                );
+
+                const tokenResponse = await axios.post(
+                    'https://api.instagram.com/oauth/access_token',
+                    tokenParams,
+                    {
+                        headers: {
+                            'Content-Type':
+                                'application/x-www-form-urlencoded'
+                        }
+                    }
+                );
+
+                const {
                     access_token: shortLivedToken
+                } = tokenResponse.data;
+
+                if (!shortLivedToken) {
+                    throw new Error(
+                        'Instagram did not return short-lived access token'
+                    );
                 }
-            });
-            
-            const { access_token: longLivedToken, expires_in } = longLivedResponse.data;
-            
-            // Retrieve Instagram Profile Information
-            console.log('Fetching Instagram user profile...');
-            const profileResponse = await axios.get('https://graph.instagram.com/me', {
-                params: {
-                    fields: 'id,username,name',
-                    access_token: longLivedToken
+
+                // 6. Exchange short-lived → long-lived
+                const longLivedResponse =
+                    await axios.get(
+                        'https://graph.instagram.com/access_token',
+                        {
+                            params: {
+                                grant_type:
+                                    'ig_exchange_token',
+                                client_secret:
+                                    clientSecret,
+                                access_token:
+                                    shortLivedToken
+                            }
+                        }
+                    );
+
+                const {
+                    access_token: longLivedToken,
+                    expires_in
+                } = longLivedResponse.data;
+
+                if (!longLivedToken) {
+                    throw new Error(
+                        'Instagram did not return long-lived access token'
+                    );
                 }
-            });
-            
-            const { id: instagramAccountId, username, name } = profileResponse.data;
-            const tokenExpiry = expires_in ? new Date(Date.now() + expires_in * 1000) : null;
-            
-            // Save to Tenant database
-            const tenant = await Tenant.findById(tenantId);
-            if (!tenant) {
-                console.error(`Tenant not found: ${tenantId}`);
-                return res.redirect(`${targetFrontend}/#/instagram-profile-setup?error=${encodeURIComponent('Tenant not found')}`);
+
+                // 7. Fetch Instagram profile
+                const profileResponse =
+                    await axios.get(
+                        'https://graph.instagram.com/me',
+                        {
+                            params: {
+                                fields:
+                                    'id,username,name',
+                                access_token:
+                                    longLivedToken
+                            }
+                        }
+                    );
+
+                const {
+                    id: instagramAccountId,
+                    username,
+                    name
+                } = profileResponse.data;
+
+                const tokenExpiry =
+                    expires_in
+                        ? new Date(
+                            Date.now() +
+                            expires_in * 1000
+                        )
+                        : null;
+
+                // 8. Find tenant
+                const tenant =
+                    await Tenant.findById(tenantId);
+
+                if (!tenant) {
+                    console.error(
+                        '[INSTAGRAM DATABASE] ❌ Tenant not found:',
+                        tenantId
+                    );
+
+                    return res.redirect(
+                        `${targetFrontend}/?error=${encodeURIComponent(
+                            'Tenant not found'
+                        )}`
+                    );
+                }
+
+                // 9. Save Instagram configuration
+                tenant.instagramConfig = {
+                    instagramAccountId,
+                    username,
+                    name: name || username,
+                    accessToken: longLivedToken,
+                    tokenExpiry,
+                    connected: true
+                };
+
+                await tenant.save();
+
+                return res.redirect(
+                    `${targetFrontend}/?instagram_connected=true`
+                );
+
+            } catch (error) {
+                console.error(
+                    '[INSTAGRAM CALLBACK] ❌ ERROR DURING OAUTH FLOW'
+                );
+                console.error(
+                    '[INSTAGRAM CALLBACK] Error message:',
+                    error.message
+                );
+                console.error(
+                    '[INSTAGRAM CALLBACK] Error response:',
+                    error.response?.data || 'No response data'
+                );
+                console.error(
+                    '[INSTAGRAM CALLBACK] HTTP status:',
+                    error.response?.status || 'N/A'
+                );
+                console.error(
+                    '[INSTAGRAM CALLBACK] Stack:',
+                    error.stack
+                );
+
+                const errMsg =
+                    error.response?.data?.error_message ||
+                    error.response?.data?.error?.message ||
+                    error.message ||
+                    'Instagram connection failed';
+
+                console.error(
+                    '[INSTAGRAM CALLBACK] Redirecting with error:',
+                    errMsg
+                );
+
+                return res.redirect(
+                    `${targetFrontend}/?error=${encodeURIComponent(
+                        errMsg
+                    )}`
+                );
             }
-            
-            tenant.instagramConfig = {
-                instagramAccountId,
-                username,
-                name: name || username,
-                accessToken: longLivedToken,
-                tokenExpiry,
-                connected: true
-            };
-            
-            await tenant.save();
-            console.log(`Instagram account ${username} successfully connected to tenant ${tenantId}`);
-            
-            // Redirect back to Sendzyy Dashboard (this triggers reload)
-            return res.redirect(`${targetFrontend}/`);
-        } catch (error) {
-            console.error('Error during Instagram token exchange/profile fetch:', error.response?.data || error.message);
-            const errMsg = error.response?.data?.error_message || error.message || 'Token exchange failed';
-            return res.redirect(`${targetFrontend}/#/instagram-profile-setup?error=${encodeURIComponent(errMsg)}`);
         }
-    });
+    );
 });
 
-// 3. Get Instagram Profile
+
+// 4. Get Instagram Profile
 app.get('/api/instagram/profile', authenticate, async (req, res) => {
     try {
-        const tenant = await Tenant.findById(req.user.tenantId);
+        const tenant =
+            await Tenant.findById(req.user.tenantId);
+
         if (!tenant) {
-            return res.status(404).json({ error: 'Tenant not found' });
+            console.error(
+                '[INSTAGRAM PROFILE API] ❌ Tenant not found'
+            );
+
+            return res.status(404).json({
+                error: 'Tenant not found'
+            });
         }
-        
-        let config = tenant.instagramConfig || { connected: false };
-        
-        // Auto-refresh long-lived token if it is connected and expires in less than 15 days
-        if (config.connected && config.accessToken && config.tokenExpiry) {
-            const expiryTime = new Date(config.tokenExpiry).getTime();
-            const timeDiff = expiryTime - Date.now();
-            const fifteenDaysInMs = 15 * 24 * 60 * 60 * 1000;
-            
-            if (timeDiff > 0 && timeDiff < fifteenDaysInMs) {
-                console.log(`Instagram long-lived token for tenant ${tenant._id} is expiring soon. Refreshing...`);
+
+        let config =
+            tenant.instagramConfig || {
+                connected: false
+            };
+
+        // Auto-refresh long-lived token if it is connected
+        // and expires in less than 15 days
+        if (
+            config.connected &&
+            config.accessToken &&
+            config.tokenExpiry
+        ) {
+            const expiryTime =
+                new Date(config.tokenExpiry).getTime();
+
+            const timeDiff =
+                expiryTime - Date.now();
+
+            const fifteenDaysInMs =
+                15 * 24 * 60 * 60 * 1000;
+
+            if (
+                timeDiff > 0 &&
+                timeDiff < fifteenDaysInMs
+            ) {
                 try {
-                    const refreshResponse = await axios.get('https://graph.instagram.com/refresh_access_token', {
-                        params: {
-                            grant_type: 'ig_refresh_token',
-                            access_token: config.accessToken
-                        }
-                    });
-                    
-                    const { access_token: newAccessToken, expires_in: newExpiresIn } = refreshResponse.data;
-                    const newTokenExpiry = newExpiresIn ? new Date(Date.now() + newExpiresIn * 1000) : null;
-                    
-                    tenant.instagramConfig.accessToken = newAccessToken;
-                    tenant.instagramConfig.tokenExpiry = newTokenExpiry;
+                    const refreshResponse =
+                        await axios.get(
+                            'https://graph.instagram.com/refresh_access_token',
+                            {
+                                params: {
+                                    grant_type:
+                                        'ig_refresh_token',
+                                    access_token:
+                                        config.accessToken
+                                }
+                            }
+                        );
+
+                    const {
+                        access_token: newAccessToken,
+                        expires_in: newExpiresIn
+                    } = refreshResponse.data;
+
+                    const newTokenExpiry =
+                        newExpiresIn
+                            ? new Date(
+                                Date.now() +
+                                newExpiresIn * 1000
+                            )
+                            : null;
+
+                    tenant.instagramConfig.accessToken =
+                        newAccessToken;
+
+                    tenant.instagramConfig.tokenExpiry =
+                        newTokenExpiry;
+
                     await tenant.save();
-                    
-                    config = tenant.instagramConfig;
-                    console.log('Instagram long-lived token refreshed successfully.');
+
+                    config =
+                        tenant.instagramConfig;
+
                 } catch (refreshErr) {
-                    console.error('Failed to auto-refresh Instagram token:', refreshErr.response?.data || refreshErr.message);
-                    // Continue returning the old profile even if refresh fails (might still be valid for a few days)
+                    console.error(
+                        '[INSTAGRAM REFRESH] ❌ Refresh failed'
+                    );
+                    console.error(
+                        '[INSTAGRAM REFRESH] Error:',
+                        refreshErr.message
+                    );
+                    console.error(
+                        '[INSTAGRAM REFRESH] Response:',
+                        refreshErr.response?.data ||
+                        'No response data'
+                    );
                 }
             }
         }
-        
-        return res.json(config);
+
+        // IMPORTANT:
+        // Never return Instagram access token to frontend
+        const safeConfig = {
+            instagramAccountId:
+                config.instagramAccountId,
+            username:
+                config.username,
+            name:
+                config.name,
+            tokenExpiry:
+                config.tokenExpiry,
+            connected:
+                config.connected
+        };
+
+        return res.json(safeConfig);
+
     } catch (error) {
-        console.error('Error fetching Instagram profile:', error);
-        return res.status(500).json({ error: 'Internal Server Error' });
+        console.error(
+            '[INSTAGRAM PROFILE API] ❌ ERROR:',
+            error.message
+        );
+        console.error(
+            '[INSTAGRAM PROFILE API] Stack:',
+            error.stack
+        );
+
+        return res.status(500).json({
+            error: 'Internal Server Error'
+        });
     }
 });
 
-// 4. Disconnect Instagram Profile
+
+// 5. Disconnect Instagram Profile
 app.post('/api/instagram/disconnect', authenticate, async (req, res) => {
     try {
-        const tenant = await Tenant.findById(req.user.tenantId);
+        const tenant =
+            await Tenant.findById(req.user.tenantId);
+
         if (!tenant) {
-            return res.status(404).json({ error: 'Tenant not found' });
+            console.error(
+                '[INSTAGRAM DISCONNECT] ❌ Tenant not found'
+            );
+
+            return res.status(404).json({
+                error: 'Tenant not found'
+            });
         }
-        
+
         tenant.instagramConfig = {
             instagramAccountId: '',
             username: '',
@@ -1267,13 +1552,28 @@ app.post('/api/instagram/disconnect', authenticate, async (req, res) => {
             tokenExpiry: null,
             connected: false
         };
-        
+
         await tenant.save();
-        console.log(`Instagram disconnected successfully for tenant: ${tenant._id}`);
-        return res.json({ success: true, message: 'Instagram profile disconnected' });
+
+        return res.json({
+            success: true,
+            message: 'Instagram profile disconnected'
+        });
+
     } catch (error) {
-        console.error('Error disconnecting Instagram:', error);
-        return res.status(500).json({ error: 'Internal Server Error' });
+        console.error(
+            '[INSTAGRAM DISCONNECT] ❌ ERROR:',
+            error.message
+        );
+
+        console.error(
+            '[INSTAGRAM DISCONNECT] Stack:',
+            error.stack
+        );
+
+        return res.status(500).json({
+            error: 'Internal Server Error'
+        });
     }
 });
 
