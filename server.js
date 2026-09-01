@@ -10,6 +10,8 @@ const jwt = require('jsonwebtoken');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
+const multer = require('multer');
 const mongoose = require('mongoose');
 require('dotenv').config();
 const { generateAppSecretProof } = require('./cryptoUtils');
@@ -565,6 +567,24 @@ fcmTokenSchema.index({ tenantId: 1, isActive: 1 });
 fcmTokenSchema.index({ token: 1 }, { unique: true });
 
 const FCMToken = mongoose.model('FCMToken', fcmTokenSchema);
+
+// ── App Version Management Schema ─────────────────────────────────────────────
+const appVersionSchema = new mongoose.Schema({
+    platform: { type: String, default: 'android', enum: ['android', 'ios'], required: true },
+    version: { type: String, required: true },
+    buildNumber: { type: Number, required: true },
+    apkUrl: { type: String, required: true },
+    apkFileName: { type: String, required: true },
+    sha256: { type: String, required: true },
+    forceUpdate: { type: Boolean, default: false },
+    releaseNotes: { type: [String], default: [] },
+    fileSize: { type: Number, default: 0 },
+    isActive: { type: Boolean, default: true },
+}, { timestamps: true });
+
+appVersionSchema.index({ platform: 1, isActive: 1, buildNumber: -1 });
+
+const AppVersion = mongoose.model('AppVersion', appVersionSchema);
 
 // ── Retry / Campaign Lifecycle / Notification Services ─────────────────────────
 const ConfigurationManager = require('./services/ConfigurationManager');
@@ -3366,10 +3386,55 @@ app.post('/send-message', authenticate, async (req, res) => {
 //  Campaigns & Reports 
 app.get('/campaigns', authenticate, async (req, res) => {
     try {
-        const campaigns = await Campaign.find({ tenantId: req.user.tenantId })
+        const page = parseInt(req.query.page, 10) || 1;
+        const limitParam = req.query.limit;
+        const isAll = req.query.all === 'true' || limitParam === 'all' || limitParam === '0';
+        const limit = isAll ? 0 : (limitParam !== undefined ? parseInt(limitParam, 10) : 20);
+        const isPaginated = limit > 0;
+        const skip = isPaginated ? (page - 1) * limit : 0;
+
+        // 1. Total count of campaigns for this tenant
+        const totalCampaigns = await Campaign.countDocuments({ tenantId: req.user.tenantId });
+
+        // 2. Compute accurate overall tenant stats across ALL campaigns (not affected by pagination)
+        const statsAgg = await Campaign.aggregate([
+            { $match: { tenantId: req.user.tenantId } },
+            {
+                $group: {
+                    _id: null,
+                    totalSent: { $sum: { $ifNull: ['$totalCount', { $ifNull: ['$successCount', 0] }] } },
+                    totalDelivered: { $sum: { $ifNull: ['$deliveredCount', 0] } },
+                    totalRead: { $sum: { $ifNull: ['$readCount', 0] } },
+                    totalFailed: { $sum: { $ifNull: ['$failureCount', 0] } }
+                }
+            }
+        ]);
+
+        const totalStats = statsAgg[0] ? {
+            totalSent: statsAgg[0].totalSent || 0,
+            totalDelivered: statsAgg[0].totalDelivered || 0,
+            totalRead: statsAgg[0].totalRead || 0,
+            totalFailed: statsAgg[0].totalFailed || 0,
+            totalCampaigns
+        } : {
+            totalSent: 0,
+            totalDelivered: 0,
+            totalRead: 0,
+            totalFailed: 0,
+            totalCampaigns
+        };
+
+        // 3. Fetch ONLY the requested page of campaigns
+        let campaignQuery = Campaign.find({ tenantId: req.user.tenantId })
             .sort({ timestamp: -1 });
 
-        // Attach hasPendingRetry flag: true if any ScheduledRetryPhase is pending/executing for this campaign
+        if (isPaginated) {
+            campaignQuery = campaignQuery.skip(skip).limit(limit);
+        }
+
+        const campaigns = await campaignQuery;
+
+        // 4. Attach hasPendingRetry flag & Recipient counts for the fetched campaigns
         const campaignIds = campaigns.map(c => c.id);
         const pendingPhases = await ScheduledRetryPhase.find({
             campaignId: { $in: campaignIds },
@@ -3377,10 +3442,6 @@ app.get('/campaigns', authenticate, async (req, res) => {
         }).select('campaignId').lean();
         const pendingSet = new Set(pendingPhases.map(p => p.campaignId));
 
-        // Compute accurate per-status counts from the Recipient collection (ground truth).
-        // The campaign-document counters (failureCount, deliveredCount, etc.) can be stale
-        // because _completeCampaign marks recipients as failed without incrementing failureCount,
-        // and webhook-based increments may arrive out of order.
         const recipientAgg = await Recipient.aggregate([
             { $match: { tenantId: req.user.tenantId, campaignId: { $in: campaignIds } } },
             {
@@ -3391,7 +3452,6 @@ app.get('/campaigns', authenticate, async (req, res) => {
             }
         ]);
 
-        // Build a lookup map: campaignId -> { sent, delivered, read, failed, total }
         const recipientCounts = {};
         for (const row of recipientAgg) {
             const cid = row._id.campaignId;
@@ -3410,16 +3470,13 @@ app.get('/campaigns', authenticate, async (req, res) => {
             const rc = recipientCounts[c.id];
             const base = c.toObject();
 
-            // If recipient docs exist, override campaign-level counters with live values.
-            // deliveredCount includes messages that were later "read" (delivery is implied).
             if (rc && rc.total > 0) {
                 base.totalCount     = rc.total;
-                base.successCount   = rc.total - rc.failed;          // non-failed = sent/delivered/read
+                base.successCount   = rc.total - rc.failed;
                 base.failureCount   = rc.failed;
-                base.deliveredCount = rc.delivered + rc.read;        // delivered still counts as delivered
+                base.deliveredCount = rc.delivered + rc.read;
                 base.readCount      = rc.read;
             }
-            // else: campaign doc fields remain as-is (campaign still dispatching, no recipients yet)
 
             return {
                 ...base,
@@ -3427,7 +3484,16 @@ app.get('/campaigns', authenticate, async (req, res) => {
             };
         });
 
-        res.json({ campaigns: enriched });
+        const hasMore = isPaginated ? (skip + campaigns.length < totalCampaigns) : false;
+
+        res.json({
+            campaigns: enriched,
+            totalStats,
+            totalCampaigns,
+            page,
+            limit: isPaginated ? limit : totalCampaigns,
+            hasMore
+        });
     } catch (error) {
         console.error('GET /campaigns error:', error);
         res.status(500).json({ error: 'Failed to fetch campaigns' });
@@ -9431,6 +9497,287 @@ app.get('/api/superadmin/dashboard-stats', authenticateSuperAdmin, async (req, r
     } catch (err) {
         console.error('[SuperAdmin] dashboard-stats error:', err.message);
         res.status(500).json({ error: 'Failed to fetch dashboard stats', details: err.message });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  APP VERSION & APK SELF-UPDATE MODULE
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── APK Storage Configuration ────────────────────────────────────────────────
+const apkUploadDir = path.join(__dirname, 'uploads', 'apk');
+if (!fs.existsSync(apkUploadDir)) {
+    fs.mkdirSync(apkUploadDir, { recursive: true });
+}
+
+const apkStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, apkUploadDir);
+    },
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        const safeName = `temp-${Date.now()}-${Math.round(Math.random() * 1E6)}${ext}`;
+        cb(null, safeName);
+    }
+});
+
+const apkUpload = multer({
+    storage: apkStorage,
+    limits: { fileSize: 300 * 1024 * 1024 }, // 300MB limit
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (ext !== '.apk') {
+            return cb(new Error('Only .apk files are allowed'));
+        }
+        cb(null, true);
+    }
+});
+
+// ── Admin Authentication Helper for App Updates ──────────────────────────────
+const authenticateAdminOrSecret = (req, res, next) => {
+    // 1. Check admin secret header or query
+    const secret = req.headers['x-admin-secret'] || req.headers['admin-secret'] || req.query.secret || req.body?.secret;
+    const adminSecret = process.env.ADMIN_UPDATE_SECRET || 'sendzyy-update-secret-9988';
+    if (secret && secret === adminSecret) {
+        return next();
+    }
+
+    // 2. Check Super Admin JWT token
+    const token = req.headers['authorization']?.split(' ')[1] || req.query.token;
+    if (token) {
+        const superSecret = process.env.SUPERADMIN_JWT_SECRET || 'sendzyy-superadmin-secret-change-me';
+        return jwt.verify(token, superSecret, (err, decoded) => {
+            if (!err && decoded && decoded.role === 'superadmin') {
+                req.superAdmin = decoded;
+                return next();
+            }
+            return res.status(403).json({ success: false, error: 'Forbidden: Invalid or expired super admin credentials' });
+        });
+    }
+
+    return res.status(401).json({ success: false, error: 'Unauthorized: Admin credentials or token required' });
+};
+
+// ── 1. GET /api/app/version (Public) ──────────────────────────────────────────
+// Returns the latest active Android release metadata
+app.get('/api/app/version', async (req, res) => {
+    try {
+        const platform = (req.query.platform || 'android').toLowerCase();
+        const latest = await AppVersion.findOne({ platform, isActive: true })
+            .sort({ buildNumber: -1, createdAt: -1 });
+
+        if (!latest) {
+            return res.json({
+                success: true,
+                data: null,
+                message: 'No active release found'
+            });
+        }
+
+        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        const apkDownloadUrl = latest.apkUrl.startsWith('http')
+            ? latest.apkUrl
+            : `${baseUrl}${latest.apkUrl.startsWith('/') ? '' : '/'}${latest.apkUrl}`;
+
+        res.json({
+            success: true,
+            data: {
+                platform: latest.platform,
+                version: latest.version,
+                buildNumber: latest.buildNumber,
+                apkUrl: apkDownloadUrl,
+                apkFileName: latest.apkFileName,
+                sha256: latest.sha256,
+                forceUpdate: latest.forceUpdate,
+                releaseNotes: latest.releaseNotes || [],
+                fileSize: latest.fileSize || 0,
+                updatedAt: latest.updatedAt,
+            }
+        });
+    } catch (err) {
+        console.error('[AppUpdate] GET /api/app/version error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to retrieve version information', details: err.message });
+    }
+});
+
+// ── 2. GET /api/app/download/android (Public) ─────────────────────────────────
+// Streams/downloads the active Android APK
+app.get('/api/app/download/android', async (req, res) => {
+    try {
+        const latest = await AppVersion.findOne({ platform: 'android', isActive: true })
+            .sort({ buildNumber: -1, createdAt: -1 });
+
+        if (!latest) {
+            return res.status(404).json({ success: false, error: 'No active release found' });
+        }
+
+        const filePath = path.join(apkUploadDir, latest.apkFileName);
+        if (!fs.existsSync(filePath)) {
+            console.error(`[AppUpdate] APK file not found on disk: ${filePath}`);
+            return res.status(404).json({ success: false, error: 'APK binary file not found on server' });
+        }
+
+        res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+        res.setHeader('Content-Disposition', `attachment; filename="${latest.apkFileName}"`);
+        res.setHeader('Content-Length', fs.statSync(filePath).size);
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+
+        const stream = fs.createReadStream(filePath);
+        stream.pipe(res);
+    } catch (err) {
+        console.error('[AppUpdate] GET /api/app/download/android error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to download APK', details: err.message });
+    }
+});
+
+// ── 3. POST /api/admin/app-version (Admin/SuperAdmin) ──────────────────────────
+// Uploads new APK release with validation and SHA-256 calculation
+app.post('/api/admin/app-version', authenticateAdminOrSecret, apkUpload.single('apk'), async (req, res) => {
+    let uploadedTempPath = req.file?.path;
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, message: 'APK file is required (form-data field: apk)' });
+        }
+
+        const { version, buildNumber, forceUpdate } = req.body;
+        let releaseNotes = req.body.releaseNotes;
+
+        if (!version || !buildNumber) {
+            if (uploadedTempPath && fs.existsSync(uploadedTempPath)) fs.unlinkSync(uploadedTempPath);
+            return res.status(400).json({ success: false, message: 'Version (e.g. 1.0.1) and buildNumber (integer) are required' });
+        }
+
+        // Validate semver format
+        const cleanVersion = String(version).trim();
+        if (!/^\d+(\.\d+)+$/.test(cleanVersion)) {
+            if (uploadedTempPath && fs.existsSync(uploadedTempPath)) fs.unlinkSync(uploadedTempPath);
+            return res.status(400).json({ success: false, message: 'Version must follow standard format (e.g. 1.0.1)' });
+        }
+
+        // Validate positive build number
+        const parsedBuild = parseInt(buildNumber, 10);
+        if (isNaN(parsedBuild) || parsedBuild <= 0) {
+            if (uploadedTempPath && fs.existsSync(uploadedTempPath)) fs.unlinkSync(uploadedTempPath);
+            return res.status(400).json({ success: false, message: 'buildNumber must be a positive integer' });
+        }
+
+        // Parse release notes
+        let parsedNotes = [];
+        if (Array.isArray(releaseNotes)) {
+            parsedNotes = releaseNotes.map(n => String(n).trim()).filter(Boolean);
+        } else if (typeof releaseNotes === 'string') {
+            try {
+                const parsed = JSON.parse(releaseNotes);
+                parsedNotes = Array.isArray(parsed) ? parsed : [releaseNotes];
+            } catch (_) {
+                parsedNotes = releaseNotes.split('\n').map(n => n.trim().replace(/^[-*•]\s*/, '')).filter(Boolean);
+            }
+        }
+
+        const isForceUpdate = forceUpdate === true || forceUpdate === 'true' || forceUpdate === '1';
+
+        // Check current active version to prevent downgrade
+        const currentActive = await AppVersion.findOne({ platform: 'android', isActive: true })
+            .sort({ buildNumber: -1 });
+
+        if (currentActive && parsedBuild <= currentActive.buildNumber) {
+            if (uploadedTempPath && fs.existsSync(uploadedTempPath)) fs.unlinkSync(uploadedTempPath);
+            return res.status(400).json({
+                success: false,
+                message: `Build number must be greater than current active build number (${currentActive.buildNumber}). Downgrades are rejected.`
+            });
+        }
+
+        // Calculate SHA-256 checksum of the uploaded APK
+        const fileBuffer = fs.readFileSync(uploadedTempPath);
+        const computedSha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+        const fileSize = fileBuffer.length;
+
+        // Clean target filename
+        const finalApkFileName = `sendzyy-${cleanVersion}-${parsedBuild}.apk`;
+        const finalApkPath = path.join(apkUploadDir, finalApkFileName);
+
+        // Move/rename temp file to final location
+        fs.renameSync(uploadedTempPath, finalApkPath);
+        uploadedTempPath = null; // Cleared
+
+        // Deactivate older releases
+        await AppVersion.updateMany({ platform: 'android' }, { isActive: false });
+
+        // Create new release document
+        const newRelease = new AppVersion({
+            platform: 'android',
+            version: cleanVersion,
+            buildNumber: parsedBuild,
+            apkUrl: '/api/app/download/android',
+            apkFileName: finalApkFileName,
+            sha256: computedSha256,
+            forceUpdate: isForceUpdate,
+            releaseNotes: parsedNotes,
+            fileSize: fileSize,
+            isActive: true,
+        });
+
+        await newRelease.save();
+
+        console.log(`[AppUpdate] ✅ New Android release published: v${cleanVersion} (Build ${parsedBuild}) — SHA256: ${computedSha256}`);
+
+        res.status(201).json({
+            success: true,
+            message: 'New version published successfully',
+            data: newRelease,
+        });
+    } catch (err) {
+        if (uploadedTempPath && fs.existsSync(uploadedTempPath)) {
+            try { fs.unlinkSync(uploadedTempPath); } catch (_) {}
+        }
+        console.error('[AppUpdate] POST /api/admin/app-version error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to upload and publish new APK', details: err.message });
+    }
+});
+
+// ── 4. GET /api/admin/app-versions (Admin/SuperAdmin) ──────────────────────────
+// Lists all release history
+app.get('/api/admin/app-versions', authenticateAdminOrSecret, async (req, res) => {
+    try {
+        const platform = (req.query.platform || 'android').toLowerCase();
+        const releases = await AppVersion.find({ platform }).sort({ buildNumber: -1, createdAt: -1 });
+        res.json({
+            success: true,
+            count: releases.length,
+            data: releases,
+        });
+    } catch (err) {
+        console.error('[AppUpdate] GET /api/admin/app-versions error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to fetch release history', details: err.message });
+    }
+});
+
+// ── 5. PATCH /api/admin/app-version/:id (Admin/SuperAdmin) ─────────────────────
+// Toggles forceUpdate or active status on an existing release
+app.patch('/api/admin/app-version/:id', authenticateAdminOrSecret, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { forceUpdate, isActive, releaseNotes } = req.body;
+
+        const updateData = {};
+        if (typeof forceUpdate !== 'undefined') updateData.forceUpdate = forceUpdate === true || forceUpdate === 'true';
+        if (typeof isActive !== 'undefined') updateData.isActive = isActive === true || isActive === 'true';
+        if (Array.isArray(releaseNotes)) updateData.releaseNotes = releaseNotes;
+
+        const updated = await AppVersion.findByIdAndUpdate(id, { $set: updateData }, { new: true });
+        if (!updated) {
+            return res.status(404).json({ success: false, message: 'Release not found' });
+        }
+
+        res.json({
+            success: true,
+            message: 'Release updated successfully',
+            data: updated,
+        });
+    } catch (err) {
+        console.error('[AppUpdate] PATCH /api/admin/app-version/:id error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to update release', details: err.message });
     }
 });
 
