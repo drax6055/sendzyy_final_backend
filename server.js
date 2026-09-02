@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -13,8 +14,14 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 const mongoose = require('mongoose');
-require('dotenv').config();
-const { generateAppSecretProof } = require('./cryptoUtils');
+const dns = require('dns');
+
+// Configure reliable DNS servers for MongoDB Atlas SRV query resolution
+try {
+    dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
+} catch (err) {
+    console.warn('Unable to set custom DNS servers:', err);
+}
 
 //  MongoDB Connection 
 if (process.env.MONGODB_URI) {
@@ -274,11 +281,20 @@ const recipientSchema = new mongoose.Schema({
         phaseNumber: Number,
         attemptedAt: Date,
         status: String
+    }],
+    // Campaign template button click tracking
+    clickedButtons: { type: [String], default: [] },   // deduped list of clicked button texts
+    buttonClicks: [{                                     // full click log with timestamps
+        buttonText: { type: String },
+        buttonId:   { type: String },
+        clickedAt:  { type: Date, default: Date.now }
     }]
 });
 recipientSchema.index({ campaignId: 1, phaseNumber: 1 });
 recipientSchema.index({ campaignId: 1, status: 1 });
 recipientSchema.index({ campaignId: 1, phaseNumber: 1, status: 1, 'retryHistory.phaseNumber': 1 });
+// wamid already has unique:true which auto-creates an index — no need to re-declare
+recipientSchema.index({ tenantId: 1, to: 1, sentAt: -1 }, { sparse: true });   // fast Strategy-2 fallback button lookup
 const Recipient = mongoose.model('Recipient', recipientSchema);
 
 const retryConfigurationSchema = new mongoose.Schema({
@@ -3476,11 +3492,22 @@ app.get('/campaigns', authenticate, async (req, res) => {
                 base.failureCount   = rc.failed;
                 base.deliveredCount = rc.delivered + rc.read;
                 base.readCount      = rc.read;
+
+                // If 100% of recipients are delivered/read with 0 failures, campaign is completed
+                const isFullyDelivered = (rc.delivered + rc.read) >= rc.total && rc.failed === 0;
+                if (isFullyDelivered) {
+                    base.status = 'completed';
+                    if (c.status !== 'completed') {
+                        campaignLifecycleManager.completeCampaign(c.id, req.user.tenantId)
+                            .catch(err => console.warn('[campaigns] auto-complete error:', err.message));
+                    }
+                }
             }
 
+            const isCompleted = base.status === 'completed';
             return {
                 ...base,
-                hasPendingRetry: pendingSet.has(c.id),
+                hasPendingRetry: !isCompleted && pendingSet.has(c.id),
             };
         });
 
@@ -4070,9 +4097,121 @@ app.get('/media/:mediaId', authenticate, async (req, res) => {
 
 app.get('/campaigns/:campaignId/recipients', authenticate, async (req, res) => {
     try {
-        const recipients = await Recipient.find({ tenantId: req.user.tenantId, campaignId: req.params.campaignId });
-        res.json(recipients);
+        const { campaignId } = req.params;
+        const tenantId = req.user.tenantId;
+
+        // Fetch all recipients for this campaign
+        const recipients = await Recipient.find({ tenantId, campaignId }).lean();
+
+        // Look up the campaign template name so we can fetch its buttons
+        const campaign = await Campaign.findOne({ tenantId, id: campaignId }).select('template').lean();
+        let templateButtons = [];
+
+        if (campaign?.template) {
+            try {
+                const tenant = await Tenant.findById(tenantId).select('whatsappConfig').lean();
+                if (tenant?.whatsappConfig?.accessToken && tenant?.whatsappConfig?.businessAccountId) {
+                    const resp = await axios.get(
+                        `${WHATSAPP_API_URL}/${tenant.whatsappConfig.businessAccountId}/message_templates`,
+                        {
+                            headers: { Authorization: `Bearer ${tenant.whatsappConfig.accessToken}` },
+                            params: { name: campaign.template }
+                        }
+                    );
+                    const tpl = (resp.data?.data || []).find(t => t.name === campaign.template);
+                    const components = tpl?.components || [];
+                    const btnComp = components.find(c => c.type === 'BUTTONS');
+                    if (btnComp?.buttons) {
+                        templateButtons = btnComp.buttons
+                            .filter(b => b.type === 'QUICK_REPLY')
+                            .map(b => ({ text: b.text, type: b.type }));
+                    }
+                }
+            } catch (tplErr) {
+                console.warn(`[recipients] Failed to fetch template buttons for campaign ${campaignId}:`, tplErr.message);
+            }
+        }
+
+        // ── Infer button clicks from Messages collection ────────────────────────
+        // EC2 saves every incoming button reply as a Message with isMe:false.
+        // We cross-reference Messages against templateButtons to find clicks.
+        if (templateButtons.length > 0 && recipients.length > 0) {
+            try {
+                const phones = [...new Set(recipients.map(r => r.to).filter(Boolean))];
+                const earliestSentAt = recipients.reduce((min, r) => {
+                    const t = r.sentAt ? new Date(r.sentAt) : null;
+                    return t && (!min || t < min) ? t : min;
+                }, null);
+
+                // Fetch all incoming messages from these recipients around or after send time
+                const queryFilter = {
+                    tenantId,
+                    contactId: { $in: phones },
+                    isMe: false,
+                };
+                if (earliestSentAt) {
+                    const bufferTime = new Date(earliestSentAt.getTime() - 60 * 1000);
+                    queryFilter.$or = [
+                        { timestamp: { $gte: bufferTime } },
+                        { time: { $gte: bufferTime.toISOString() } },
+                    ];
+                }
+
+                const buttonMessages = await Message.find(queryFilter)
+                    .select('contactId text timestamp time messageType')
+                    .lean();
+
+                // Build a map: phone → Set of clicked button texts
+                const inferredClicks = {};
+                for (const msg of buttonMessages) {
+                    const rawText = (msg.text || '').trim();
+                    const cleanTextLower = rawText.replace(/^[↩️\s]+/, '').toLowerCase();
+
+                    const matchedBtn = templateButtons.find(b => {
+                        const btnText = (b.text || '').trim().toLowerCase();
+                        return btnText && cleanTextLower === btnText;
+                    });
+
+                    if (matchedBtn) {
+                        if (!inferredClicks[msg.contactId]) inferredClicks[msg.contactId] = new Set();
+                        inferredClicks[msg.contactId].add(matchedBtn.text.trim());
+                    }
+                }
+
+                // Merge inferred clicks into recipient records and persist
+                for (const r of recipients) {
+                    const inferred = inferredClicks[r.to];
+                    if (inferred && inferred.size > 0) {
+                        const existing = new Set((r.clickedButtons || []).map(b => b.trim().toLowerCase()));
+                        const merged = [...(r.clickedButtons || [])];
+                        for (const btn of inferred) {
+                            if (!existing.has(btn.toLowerCase())) merged.push(btn);
+                        }
+                        r.clickedButtons = merged;
+
+                        // Persist to MongoDB Recipient document
+                        Recipient.findByIdAndUpdate(r._id, {
+                            $set: { clickedButtons: merged },
+                            $addToSet: {
+                                buttonClicks: {
+                                    $each: Array.from(inferred).map(text => ({
+                                        buttonText: text,
+                                        clickedAt: new Date()
+                                    }))
+                                }
+                            }
+                        }).catch(e => console.warn('[recipients] click persist error:', e.message));
+                    }
+                }
+            } catch (inferErr) {
+                console.warn('[recipients] Button click inference error:', inferErr.message);
+            }
+        }
+        // ── End button click inference ──────────────────────────────────────────
+
+        res.json({ recipients, templateButtons });
     } catch (error) {
+        console.error('[/campaigns/:campaignId/recipients] error:', error.message);
         res.status(500).json({ error: 'Failed to fetch recipients' });
     }
 });
@@ -6914,7 +7053,7 @@ app.post('/webhook', async (req, res) => {
                                     deliveredCount: { $max: [0, { $subtract: ['$deliveredCount', 1] }] }
                                 }
                             }
-                        ]);
+                        ], { new: true });
                     } else if (status === 'failed') {
                         // Note: failureCount here = delivery failures (message failed AFTER being sent to Meta).
                         // successCount is NOT decremented — it remains the API-acceptance count (how many
@@ -6972,6 +7111,20 @@ app.post('/webhook', async (req, res) => {
                         }
                     }
 
+                    if (status === 'delivered' || status === 'read') {
+                        try {
+                            const remainingUndelivered = await Recipient.countDocuments({
+                                campaignId: mapping.campaignId,
+                                status: { $nin: ['delivered', 'read'] }
+                            });
+                            if (remainingUndelivered === 0) {
+                                await campaignLifecycleManager.completeCampaign(mapping.campaignId, mapping.tenantId);
+                            }
+                        } catch (autoCompErr) {
+                            console.warn('[webhook] auto completeCampaign check error:', autoCompErr.message);
+                        }
+                    }
+
                     await broadcastCampaigns(mapping.tenantId);
                 }
             }
@@ -6992,6 +7145,92 @@ app.post('/webhook', async (req, res) => {
                 const message = value.messages[0];
                 const from = message.from;
                 const profileName = value.contacts?.[0]?.profile?.name || 'Unknown Sender';
+
+                // ── Campaign Button Click Tracking ──────────────────────────────
+                // When a contact taps a quick-reply button on a campaign template,
+                // Meta sends an interactive button_reply message. We persist that
+                // click on the Recipient record for that specific campaign message.
+                // ── Handles BOTH Meta button reply formats: ──────────────────────────
+                //   1. message.type === 'interactive', interactive.type === 'button_reply'
+                //      → New Cloud API format for interactive quick-reply buttons
+                //   2. message.type === 'button', message.button.text
+                //      → Legacy format Meta sends for template quick-reply button taps
+                const isInteractiveButtonReply =
+                    message.type === 'interactive' && message.interactive?.type === 'button_reply';
+                const isLegacyButtonReply =
+                    message.type === 'button' && (message.button?.text || message.button?.payload);
+
+                if (isInteractiveButtonReply || isLegacyButtonReply) {
+                    try {
+                        const buttonText = isInteractiveButtonReply
+                            ? (message.interactive.button_reply?.title || '')
+                            : (message.button?.text || message.button?.payload || '');
+                        const buttonId = isInteractiveButtonReply
+                            ? (message.interactive.button_reply?.id || '')
+                            : (message.button?.payload || '');
+                        // context.id = wamid of the original sent template message (exact match)
+                        const contextWamid = message.context?.id || null;
+
+                        if (buttonText) {
+                            let recipient = null;
+
+                            // Strategy 1: Exact match by the original message's wamid (most accurate)
+                            if (contextWamid) {
+                                recipient = await Recipient.findOne({ wamid: contextWamid });
+                            }
+
+                            // Strategy 2: Fallback — most recent campaign Recipient for this phone
+                            // Limit to last 7 days to avoid attributing to a wrong older campaign
+                            if (!recipient) {
+                                const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+                                recipient = await Recipient.findOne(
+                                    {
+                                        tenantId,
+                                        to: from,
+                                        campaignId: { $ne: null, $exists: true },
+                                        sentAt: { $gte: sevenDaysAgo.toISOString() }
+                                    },
+                                    null,
+                                    { sort: { sentAt: -1 } }
+                                );
+                            }
+
+                            if (recipient) {
+                                await Recipient.findByIdAndUpdate(recipient._id, {
+                                    $addToSet: { clickedButtons: buttonText },
+                                    $push: {
+                                        buttonClicks: {
+                                            buttonText,
+                                            buttonId,
+                                            clickedAt: new Date()
+                                        }
+                                    }
+                                });
+
+                                console.log(JSON.stringify({
+                                    service: 'webhook',
+                                    event: 'campaign_button_clicked',
+                                    tenantId,
+                                    from,
+                                    campaignId: recipient.campaignId,
+                                    buttonText,
+                                    buttonId,
+                                    messageType: message.type,
+                                    matchedBy: contextWamid ? 'context_wamid' : 'phone_fallback',
+                                    timestamp: new Date().toISOString()
+                                }));
+
+                                await broadcastCampaigns(tenantId);
+                            } else {
+                                console.log(`[Webhook] button click from ${from} (type=${message.type}) — no matching campaign recipient found within last 7 days`);
+                            }
+                        }
+                    } catch (btnErr) {
+                        // Non-fatal — log and continue to chatbot processing
+                        console.error('[Webhook] Campaign button click tracking error:', btnErr.message);
+                    }
+                }
+                // ── End Campaign Button Click Tracking ──────────────────────────
 
                 await chatbotEngineProcessMessage(tenantId, message, profileName, from, tenant);
             }
@@ -8626,6 +8865,99 @@ Respond with ONLY a valid JSON object in this exact format (no markdown, no extr
  *
  * Requirements: 10.3, 10.4
  */
+// ── TEMP DEBUG: check button click state for a phone number ──────────────────
+// Usage: GET /api/debug/button-clicks/PHONE_NUMBER  (no auth for quick debugging)
+app.get('/api/debug/campaign-recipients/:campaignId', async (req, res) => {
+    try {
+        const { campaignId } = req.params;
+        const recipients = await Recipient.find({ campaignId }).lean();
+        const campaign = await Campaign.findOne({ id: campaignId }).select('template tenantId').lean();
+        const tenantId = campaign?.tenantId || recipients[0]?.tenantId;
+
+        let templateButtons = [];
+        if (campaign?.template) {
+            try {
+                const tenant = await Tenant.findById(tenantId).select('whatsappConfig').lean();
+                if (tenant?.whatsappConfig?.accessToken && tenant?.whatsappConfig?.businessAccountId) {
+                    const resp = await axios.get(
+                        `${WHATSAPP_API_URL}/${tenant.whatsappConfig.businessAccountId}/message_templates`,
+                        {
+                            headers: { Authorization: `Bearer ${tenant.whatsappConfig.accessToken}` },
+                            params: { name: campaign.template }
+                        }
+                    );
+                    const tpl = (resp.data?.data || []).find(t => t.name === campaign.template);
+                    const components = tpl?.components || [];
+                    const btnComp = components.find(c => c.type === 'BUTTONS');
+                    if (btnComp?.buttons) {
+                        templateButtons = btnComp.buttons
+                            .filter(b => b.type === 'QUICK_REPLY')
+                            .map(b => ({ text: b.text, type: b.type }));
+                    }
+                }
+            } catch (tplErr) {
+                console.warn('[debug] template fetch error:', tplErr.message);
+            }
+        }
+
+        // Run inference
+        if (templateButtons.length > 0 && recipients.length > 0) {
+            const phones = [...new Set(recipients.map(r => r.to).filter(Boolean))];
+            const buttonMessages = await Message.find({
+                contactId: { $in: phones },
+                isMe: false,
+            }).select('contactId text timestamp time messageType').lean();
+
+            const inferredClicks = {};
+            for (const msg of buttonMessages) {
+                const rawText = (msg.text || '').trim();
+                const cleanTextLower = rawText.replace(/^[↩️\s]+/, '').toLowerCase();
+                const matchedBtn = templateButtons.find(b => {
+                    const btnText = (b.text || '').trim().toLowerCase();
+                    return btnText && cleanTextLower === btnText;
+                });
+                if (matchedBtn) {
+                    if (!inferredClicks[msg.contactId]) inferredClicks[msg.contactId] = new Set();
+                    inferredClicks[msg.contactId].add(matchedBtn.text.trim());
+                }
+            }
+
+            for (const r of recipients) {
+                const inferred = inferredClicks[r.to];
+                if (inferred && inferred.size > 0) {
+                    const existing = new Set((r.clickedButtons || []).map(b => b.trim().toLowerCase()));
+                    const merged = [...(r.clickedButtons || [])];
+                    for (const btn of inferred) {
+                        if (!existing.has(btn.toLowerCase())) merged.push(btn);
+                    }
+                    r.clickedButtons = merged;
+                }
+            }
+        }
+
+        res.json({ campaign, templateButtons, recipients });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/debug/button-clicks/:phone', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const recipients = await Recipient.find({ to: phone })
+            .sort({ _id: -1 }).limit(5)
+            .select('to status campaignId tenantId wamid clickedButtons buttonClicks sentAt')
+            .lean();
+        const messages = await Message.find({ contactId: phone })
+            .sort({ _id: -1 }).limit(10)
+            .select('contactId text isMe messageType source timestamp time')
+            .lean();
+        res.json({ phone, recipients, messages });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/api/admin/retry-system/health', authenticate, async (req, res) => {
     try {
         const now = new Date();

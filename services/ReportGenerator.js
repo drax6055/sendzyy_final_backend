@@ -177,17 +177,32 @@ class ReportGenerator {
             ? (cumulativeSuccess / totalRecipients) * 100 
             : 0;
 
+        // If 100% of recipients are delivered, campaign is completed (no more retries needed)
+        const isAllDelivered = totalRecipients > 0 && cumulativeSuccess >= totalRecipients;
+        const finalStatus = isAllDelivered ? 'completed' : campaign.status;
+
+        // Auto-complete in DB and cancel pending phases if 100% delivered
+        if (isAllDelivered && campaign.status !== 'completed') {
+            this.Campaign.updateOne({ id: campaignId }, { $set: { status: 'completed' } })
+                .catch(e => console.warn('[ReportGenerator] campaign complete update error:', e.message));
+            this.ScheduledRetryPhase.updateMany({ campaignId, status: 'pending' }, { $set: { status: 'cancelled' } })
+                .catch(e => console.warn('[ReportGenerator] cancel pending phases error:', e.message));
+        }
+
+        // Only show completed phases if 100% delivered (no pending retry phase should show)
+        const finalPhases = isAllDelivered ? phases.filter(p => p.status === 'completed') : phases;
+
         // Calculate remaining retries
         const maxPhases = campaign.retryConfig?.phases?.length || 0;
-        const remainingRetries = Math.max(0, maxPhases + 1 - campaign.currentPhase);
+        const remainingRetries = isAllDelivered ? 0 : Math.max(0, maxPhases + 1 - campaign.currentPhase);
 
         // Build report object
         const report = {
             campaignId: campaign.id,
-            status: campaign.status,
+            status: finalStatus,
             currentPhase: campaign.currentPhase,
             totalRecipients, // Requirement 7.1
-            phases, // Requirements 7.2, 7.3, 7.6, 7.7
+            phases: finalPhases, // Requirements 7.2, 7.3, 7.6, 7.7
             cumulativeSuccess, // Requirement 7.4
             overallSuccessRate: parseFloat(overallSuccessRate.toFixed(2)), // Requirement 7.5
             remainingRetries
@@ -258,7 +273,7 @@ class ReportGenerator {
             .sort({ deliveryTimestamp: 1, _id: 1 })
             .skip(skip)
             .limit(limit)
-            .select('to status phaseNumber deliveryTimestamp sentAt deliveredAt readAt failedAt retryHistory')
+            .select('to name status phaseNumber deliveryTimestamp sentAt deliveredAt readAt failedAt retryHistory clickedButtons buttonClicks')
             .lean();
 
         // Get total count for pagination

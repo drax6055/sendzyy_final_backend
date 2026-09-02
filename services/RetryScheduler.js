@@ -344,6 +344,18 @@ class RetryScheduler {
             timestamp: new Date().toISOString()
         }));
 
+        // Check if campaign is already completed — cancel phase if so
+        if (this.Campaign) {
+            const campaign = await this.Campaign.findOne({ id: phase.campaignId });
+            if (campaign && campaign.status === 'completed') {
+                await this.ScheduledRetryPhase.findByIdAndUpdate(phase._id, {
+                    $set: { status: 'cancelled', executedAt: new Date(), errorMessage: 'Campaign already completed' }
+                });
+                console.log(`[RetryScheduler] Phase ${phase.phaseNumber} for campaign ${phase.campaignId} cancelled — campaign already completed`);
+                return;
+            }
+        }
+
         // Check if phaseExecutor is available
         if (!this.phaseExecutor) {
             console.warn(
