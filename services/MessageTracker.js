@@ -262,6 +262,186 @@ class MessageTracker {
             failureCount
         };
     }
+
+    /**
+     * Atomically processes incoming webhook status updates (sent, delivered, read, failed).
+     * Enforces DB-level atomicity, prevents duplicate campaign counter increments,
+     * prevents out-of-order state regression, and backfills deliveredAt safely.
+     * 
+     * @param {Object} statusUpdate - Status update object from Meta
+     * @param {Object} context - Model dependencies and broadcast functions
+     */
+    async processStatusUpdateAtomic(statusUpdate, context = {}) {
+        const STATUS_RANK = { sent: 1, delivered: 2, read: 3, failed: 4 };
+
+        const wamid = statusUpdate?.id;
+        const incomingStatus = statusUpdate?.status;
+        const incomingRank = STATUS_RANK[incomingStatus];
+        const incomingTimestamp = statusUpdate?.timestamp
+            ? new Date(parseInt(statusUpdate.timestamp, 10) * 1000)
+            : new Date();
+
+        if (!wamid || !incomingRank) return { success: false, reason: 'invalid_status_payload' };
+
+        const Recipient = context.Recipient || this.Recipient;
+        const StatusMapping = context.StatusMapping || mongoose.model('StatusMapping');
+        const Campaign = context.Campaign || mongoose.model('Campaign');
+        const Message = context.Message || mongoose.model('Message');
+        const broadcastMessages = context.broadcastMessages || (async () => {});
+        const broadcastCampaigns = context.broadcastCampaigns || (async () => {});
+
+        const mapping = await StatusMapping.findOne({ wamid }).lean();
+        if (!mapping?.tenantId) {
+            return { success: false, reason: 'unmapped_wamid' };
+        }
+
+        const tenantId = mapping.tenantId;
+        const campaignId = mapping.campaignId;
+        const campaignFilter = campaignId ? { tenantId, id: campaignId } : null;
+
+        // ---------------------------------------------------------
+        // CASE 0: SENT
+        // ---------------------------------------------------------
+        if (incomingStatus === 'sent') {
+            const updated = await Recipient.findOneAndUpdate(
+                { wamid, sentAt: null },
+                { $set: { sentAt: incomingTimestamp.toISOString(), status: incomingStatus } },
+                { returnDocument: 'after' }
+            );
+
+            if (!updated) {
+                console.debug(`[Webhook][Dedup] Duplicate 'sent' for ${wamid} — skipped`);
+                return { success: true, duplicate: true, status: 'sent' };
+            }
+
+            if (campaignFilter) {
+                await Campaign.updateOne(campaignFilter, { $inc: { successCount: 1 } });
+                await broadcastCampaigns(tenantId);
+            }
+            await Message.updateOne(
+                { wamid, status: { $nin: ['delivered', 'read'] } },
+                { $set: { status: 'sent' } }
+            );
+            await broadcastMessages(tenantId, mapping.to);
+            return { success: true, duplicate: false, status: 'sent' };
+        }
+
+        // ---------------------------------------------------------
+        // CASE A: DELIVERED
+        // ---------------------------------------------------------
+        if (incomingStatus === 'delivered') {
+            const updatedRecipient = await Recipient.findOneAndUpdate(
+                { wamid, deliveredAt: null },
+                {
+                    $set: {
+                        deliveredAt: incomingTimestamp.toISOString(),
+                        deliveryTimestamp: incomingTimestamp,
+                        status: incomingStatus
+                    }
+                },
+                { returnDocument: 'after' }
+            );
+
+            if (!updatedRecipient) {
+                console.debug(`[Webhook][Dedup] Duplicate 'delivered' for ${wamid} — skipped`);
+                return { success: true, duplicate: true, status: 'delivered' };
+            }
+
+            if (campaignFilter) {
+                await Campaign.updateOne(campaignFilter, { $inc: { deliveredCount: 1 } });
+            }
+            await Message.updateOne({ wamid, status: { $ne: 'read' } }, { $set: { status: 'delivered' } });
+            await broadcastMessages(tenantId, mapping.to);
+
+            if (campaignFilter) {
+                const camp = await Campaign.findOne(campaignFilter, { currentPhase: 1 });
+                if (camp) {
+                    await this.recordDelivery(wamid, camp.currentPhase, incomingTimestamp);
+                }
+                await broadcastCampaigns(tenantId);
+            }
+            return { success: true, duplicate: false, status: 'delivered' };
+        }
+
+        // ---------------------------------------------------------
+        // CASE B: READ
+        // ---------------------------------------------------------
+        if (incomingStatus === 'read') {
+            // Aggregation-pipeline update: only fills deliveredAt if it was NOT already set.
+            // Prevents a true, earlier deliveredAt from being overwritten by the later read timestamp.
+            const updatedRecipient = await Recipient.findOneAndUpdate(
+                { wamid, readAt: null },
+                [
+                    {
+                        $set: {
+                            readAt: incomingTimestamp.toISOString(),
+                            status: 'read',
+                            deliveredAt: { $ifNull: ['$deliveredAt', incomingTimestamp.toISOString()] },
+                            deliveryTimestamp: { $ifNull: ['$deliveryTimestamp', incomingTimestamp] }
+                        }
+                    }
+                ],
+                { returnDocument: 'before', updatePipeline: true }
+            );
+
+            if (!updatedRecipient) {
+                console.debug(`[Webhook][Dedup] Duplicate 'read' for ${wamid} — skipped`);
+                return { success: true, duplicate: true, status: 'read' };
+            }
+
+            const wasAlreadyDelivered = Boolean(updatedRecipient.deliveredAt);
+            const campaignInc = { readCount: 1 };
+            if (!wasAlreadyDelivered) {
+                campaignInc.deliveredCount = 1; // out-of-order read arrived before delivered
+            }
+
+            if (campaignFilter) {
+                await Campaign.updateOne(campaignFilter, { $inc: campaignInc });
+            }
+            await Message.updateOne({ wamid }, { $set: { status: 'read' } });
+            await broadcastMessages(tenantId, mapping.to);
+
+            if (campaignFilter) {
+                const camp = await Campaign.findOne(campaignFilter, { currentPhase: 1 });
+                if (camp) {
+                    await this.recordDelivery(wamid, camp.currentPhase, incomingTimestamp);
+                }
+                await broadcastCampaigns(tenantId);
+            }
+            return { success: true, duplicate: false, status: 'read' };
+        }
+
+        // ---------------------------------------------------------
+        // CASE C: FAILED
+        // ---------------------------------------------------------
+        if (incomingStatus === 'failed') {
+            const errObj = statusUpdate.errors?.[0];
+            const errorDetails = errObj?.error_data?.details || errObj?.message || errObj?.title || 'Meta delivery failure';
+
+            // Guard: never downgrade a recipient that already reached delivered/read
+            const updatedRecipient = await Recipient.findOneAndUpdate(
+                { wamid, failedAt: null, status: { $nin: ['delivered', 'read'] } },
+                { $set: { failedAt: incomingTimestamp.toISOString(), status: 'failed' } },
+                { returnDocument: 'after' }
+            );
+
+            if (!updatedRecipient) {
+                console.debug(`[Webhook][Dedup/Guard] 'failed' for ${wamid} skipped (duplicate or already delivered/read)`);
+                return { success: true, duplicate: true, status: 'failed' };
+            }
+
+            if (campaignFilter) {
+                await Campaign.updateOne(campaignFilter, { $inc: { failureCount: 1 } });
+            }
+            await Message.updateOne({ wamid }, { $set: { status: 'failed', errorDetails } });
+            await broadcastMessages(tenantId, mapping.to);
+            if (campaignFilter) await broadcastCampaigns(tenantId);
+            return { success: true, duplicate: false, status: 'failed' };
+        }
+
+        return { success: false, reason: 'unhandled_status' };
+    }
 }
 
 module.exports = MessageTracker;
+

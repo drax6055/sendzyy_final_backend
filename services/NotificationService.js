@@ -59,10 +59,10 @@ const NotificationService = {
                 console.warn('[NotificationService] Socket emit error:', sockErr.message);
             }
 
-            // 4. Dispatch FCM Push Notification to tenant devices (direct multicast + topic)
+            // 4. Dispatch FCM Push Notification to tenant devices
             try {
                 const activeTokens = await FCMToken.find({ tenantId, isActive: true }).select('token');
-                const tokenList = activeTokens.map(t => t.token).filter(Boolean);
+                const tokenList = [...new Set(activeTokens.map(t => t.token).filter(Boolean))];
 
                 const pushPayload = {
                     title,
@@ -77,13 +77,14 @@ const NotificationService = {
                     }
                 };
 
+                let fcmResult = { success: false };
                 // Send direct multicast to all active tokens for instant high-priority delivery
                 if (tokenList.length > 0) {
-                    await FCMService.sendMulticast(tokenList, pushPayload);
+                    fcmResult = await FCMService.sendMulticast(tokenList, pushPayload);
+                } else {
+                    // Fallback to topic broadcast only if no individual device tokens are registered
+                    fcmResult = await FCMService.sendToTenant(tenantId, pushPayload);
                 }
-
-                // Also broadcast to tenant topic for multi-device coverage
-                const fcmResult = await FCMService.sendToTenant(tenantId, pushPayload);
 
                 if (fcmResult.success) {
                     notification.pushSent = true;
@@ -194,12 +195,30 @@ const NotificationService = {
             { new: true }
         );
 
+        return { notification, unreadCount };
+    },
+
+    /**
+     * Delete all notifications (soft delete) for a tenant, optionally filtered by category
+     */
+    async deleteAll(tenantId, category = null) {
+        const Notification = mongoose.model('Notification');
+        const query = { tenantId, isDeleted: false };
+        if (category && category !== 'all') {
+            query.category = category;
+        }
+
+        await Notification.updateMany(
+            query,
+            { isDeleted: true }
+        );
+
         const unreadCount = await Notification.countDocuments({ tenantId, isRead: false, isDeleted: false });
         if (SocketEmitter._io) {
             SocketEmitter._io.to(tenantId).emit('notification:count', { unreadCount });
         }
 
-        return { notification, unreadCount };
+        return { success: true, unreadCount };
     }
 };
 

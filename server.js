@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -10,9 +11,21 @@ const jwt = require('jsonwebtoken');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
+const multer = require('multer');
 const mongoose = require('mongoose');
-require('dotenv').config();
-const { generateAppSecretProof } = require('./cryptoUtils');
+const dns = require('dns');
+
+// Configure reliable DNS servers for MongoDB Atlas SRV query resolution
+try {
+    dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
+} catch (err) {
+    console.warn('Unable to set custom DNS servers:', err);
+}
+const { verifyMetaWebhookSignature } = require('./middleware/verifyMetaSignature');
+const WebhookRawLog = require('./models/WebhookRawLog');
+const webhookIngestionService = require('./services/WebhookIngestionService');
+const { processIncomingWebhookPayload } = require('./services/WebhookRouter');
 
 // ── Instagram Modular Imports ────────────────────────────────────────────────
 const InstagramAutomation = require('./models/InstagramAutomation');
@@ -27,6 +40,10 @@ if (process.env.MONGODB_URI) {
             console.log(' MongoDB connected');
             // Seed panel packages into database table if missing
             await seedPanelPackages();
+            // Backfill reporting timezone for existing tenants
+            await backfillTenantReportingTimezones();
+            // Recover any pending/stuck webhook logs on boot
+            await webhookIngestionService.recoverPendingWebhookLogs();
             // Drop the old unique compound index on {tenantId, version} if it exists.
             // We now use a single-field unique index on {tenantId} since one doc per tenant.
             try {
@@ -79,6 +96,7 @@ const tenantSchema = new mongoose.Schema({
         tokenExpiry: { type: Date, default: null },   // null = never expires (system user token)
         tokenType: { type: String, default: 'user' }, // 'user' | 'system_user'
         tokenStatus: { type: String, default: 'active', enum: ['active', 'expiring_soon', 'expired', 'unknown'] },
+        reportingTimezone: { type: String, default: 'Asia/Kolkata' }, // WABA timezone for daily analytics reconciliation
     },
     webhookSecret: { type: String, default: '' },  // AES-256 encrypted hex string
     openaiApiKey: { type: String, default: '' },
@@ -94,6 +112,26 @@ const tenantSchema = new mongoose.Schema({
     status: { type: String, enum: ['active', 'inactive'], default: 'active' },
 }, { timestamps: true });
 const Tenant = mongoose.model('Tenant', tenantSchema);
+
+async function backfillTenantReportingTimezones() {
+    try {
+        const res = await Tenant.updateMany(
+            {
+                $or: [
+                    { 'whatsappConfig.reportingTimezone': { $exists: false } },
+                    { 'whatsappConfig.reportingTimezone': null },
+                    { 'whatsappConfig.reportingTimezone': '' }
+                ]
+            },
+            { $set: { 'whatsappConfig.reportingTimezone': 'Asia/Kolkata' } }
+        );
+        if (res.modifiedCount > 0) {
+            console.log(`[Startup] Backfilled reportingTimezone for ${res.modifiedCount} tenant(s) to 'Asia/Kolkata'`);
+        }
+    } catch (e) {
+        console.error('[Startup] Failed to backfill tenant reporting timezones:', e.message);
+    }
+}
 
 const clientSchema = new mongoose.Schema({
     tenantId: { type: String, required: true },
@@ -280,11 +318,23 @@ const recipientSchema = new mongoose.Schema({
         phaseNumber: Number,
         attemptedAt: Date,
         status: String
+    }],
+    // Campaign template button click tracking
+    clickedButtons: { type: [String], default: [] },   // deduped list of clicked button texts
+    buttonClicks: [{                                     // full click log with timestamps
+        buttonText: { type: String },
+        buttonId:   { type: String },
+        clickedAt:  { type: Date, default: Date.now }
     }]
 });
 recipientSchema.index({ campaignId: 1, phaseNumber: 1 });
 recipientSchema.index({ campaignId: 1, status: 1 });
 recipientSchema.index({ campaignId: 1, phaseNumber: 1, status: 1, 'retryHistory.phaseNumber': 1 });
+recipientSchema.index({ wamid: 1, sentAt: 1 }, { sparse: true, background: true });
+recipientSchema.index({ wamid: 1, deliveredAt: 1 }, { sparse: true, background: true });
+recipientSchema.index({ wamid: 1, readAt: 1 }, { sparse: true, background: true });
+recipientSchema.index({ wamid: 1, failedAt: 1 }, { sparse: true, background: true });
+recipientSchema.index({ tenantId: 1, deliveryTimestamp: 1 }, { background: true });
 const Recipient = mongoose.model('Recipient', recipientSchema);
 
 const retryConfigurationSchema = new mongoose.Schema({
@@ -574,6 +624,24 @@ fcmTokenSchema.index({ token: 1 }, { unique: true });
 
 const FCMToken = mongoose.model('FCMToken', fcmTokenSchema);
 
+// ── App Version Management Schema ─────────────────────────────────────────────
+const appVersionSchema = new mongoose.Schema({
+    platform: { type: String, default: 'android', enum: ['android', 'ios'], required: true },
+    version: { type: String, required: true },
+    buildNumber: { type: Number, required: true },
+    apkUrl: { type: String, required: true },
+    apkFileName: { type: String, required: true },
+    sha256: { type: String, required: true },
+    forceUpdate: { type: Boolean, default: false },
+    releaseNotes: { type: [String], default: [] },
+    fileSize: { type: Number, default: 0 },
+    isActive: { type: Boolean, default: true },
+}, { timestamps: true });
+
+appVersionSchema.index({ platform: 1, isActive: 1, buildNumber: -1 });
+
+const AppVersion = mongoose.model('AppVersion', appVersionSchema);
+
 // ── Retry / Campaign Lifecycle / Notification Services ─────────────────────────
 const ConfigurationManager = require('./services/ConfigurationManager');
 const RetryScheduler = require('./services/RetryScheduler');
@@ -767,7 +835,12 @@ app.options(/.*/, cors(corsOptions));
 const httpServer = http.createServer(app);
 const io = new Server(httpServer, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 SocketEmitter.setIo(io);
-app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.json({
+    limit: '50mb',
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString();
+    }
+}));
 
 // ── Mount Modular Instagram Routes ───────────────────────────────────────────
 app.set('TenantModel', Tenant);
@@ -1288,6 +1361,21 @@ app.patch('/api/notifications/mark-all-read', async (req, res) => {
     } catch (err) {
         console.error('[Notifications API] Error marking all read:', err.message);
         res.status(500).json({ error: 'Failed to mark all read' });
+    }
+});
+
+// 5b. Clear/Delete all notifications for a tenant
+app.delete('/api/notifications/clear-all', async (req, res) => {
+    const tenantId = req.headers['tenant-id'] || req.query.tenantId || req.body?.tenantId;
+    const category = req.query.category || req.body?.category || null;
+    if (!tenantId) return res.status(400).json({ error: 'tenantId is required' });
+
+    try {
+        const result = await NotificationService.deleteAll(tenantId, category);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[Notifications API] Error clearing all notifications:', err.message);
+        res.status(500).json({ error: 'Failed to clear all notifications' });
     }
 });
 
@@ -2895,10 +2983,55 @@ app.post('/send-message', authenticate, async (req, res) => {
 //  Campaigns & Reports 
 app.get('/campaigns', authenticate, async (req, res) => {
     try {
-        const campaigns = await Campaign.find({ tenantId: req.user.tenantId })
+        const page = parseInt(req.query.page, 10) || 1;
+        const limitParam = req.query.limit;
+        const isAll = req.query.all === 'true' || limitParam === 'all' || limitParam === '0';
+        const limit = isAll ? 0 : (limitParam !== undefined ? parseInt(limitParam, 10) : 20);
+        const isPaginated = limit > 0;
+        const skip = isPaginated ? (page - 1) * limit : 0;
+
+        // 1. Total count of campaigns for this tenant
+        const totalCampaigns = await Campaign.countDocuments({ tenantId: req.user.tenantId });
+
+        // 2. Compute accurate overall tenant stats across ALL campaigns (not affected by pagination)
+        const statsAgg = await Campaign.aggregate([
+            { $match: { tenantId: req.user.tenantId } },
+            {
+                $group: {
+                    _id: null,
+                    totalSent: { $sum: { $ifNull: ['$totalCount', { $ifNull: ['$successCount', 0] }] } },
+                    totalDelivered: { $sum: { $ifNull: ['$deliveredCount', 0] } },
+                    totalRead: { $sum: { $ifNull: ['$readCount', 0] } },
+                    totalFailed: { $sum: { $ifNull: ['$failureCount', 0] } }
+                }
+            }
+        ]);
+
+        const totalStats = statsAgg[0] ? {
+            totalSent: statsAgg[0].totalSent || 0,
+            totalDelivered: statsAgg[0].totalDelivered || 0,
+            totalRead: statsAgg[0].totalRead || 0,
+            totalFailed: statsAgg[0].totalFailed || 0,
+            totalCampaigns
+        } : {
+            totalSent: 0,
+            totalDelivered: 0,
+            totalRead: 0,
+            totalFailed: 0,
+            totalCampaigns
+        };
+
+        // 3. Fetch ONLY the requested page of campaigns
+        let campaignQuery = Campaign.find({ tenantId: req.user.tenantId })
             .sort({ timestamp: -1 });
 
-        // Attach hasPendingRetry flag: true if any ScheduledRetryPhase is pending/executing for this campaign
+        if (isPaginated) {
+            campaignQuery = campaignQuery.skip(skip).limit(limit);
+        }
+
+        const campaigns = await campaignQuery;
+
+        // 4. Attach hasPendingRetry flag & Recipient counts for the fetched campaigns
         const campaignIds = campaigns.map(c => c.id);
         const pendingPhases = await ScheduledRetryPhase.find({
             campaignId: { $in: campaignIds },
@@ -2906,10 +3039,6 @@ app.get('/campaigns', authenticate, async (req, res) => {
         }).select('campaignId').lean();
         const pendingSet = new Set(pendingPhases.map(p => p.campaignId));
 
-        // Compute accurate per-status counts from the Recipient collection (ground truth).
-        // The campaign-document counters (failureCount, deliveredCount, etc.) can be stale
-        // because _completeCampaign marks recipients as failed without incrementing failureCount,
-        // and webhook-based increments may arrive out of order.
         const recipientAgg = await Recipient.aggregate([
             { $match: { tenantId: req.user.tenantId, campaignId: { $in: campaignIds } } },
             {
@@ -2920,7 +3049,6 @@ app.get('/campaigns', authenticate, async (req, res) => {
             }
         ]);
 
-        // Build a lookup map: campaignId -> { sent, delivered, read, failed, total }
         const recipientCounts = {};
         for (const row of recipientAgg) {
             const cid = row._id.campaignId;
@@ -2939,24 +3067,41 @@ app.get('/campaigns', authenticate, async (req, res) => {
             const rc = recipientCounts[c.id];
             const base = c.toObject();
 
-            // If recipient docs exist, override campaign-level counters with live values.
-            // deliveredCount includes messages that were later "read" (delivery is implied).
             if (rc && rc.total > 0) {
                 base.totalCount     = rc.total;
-                base.successCount   = rc.total - rc.failed;          // non-failed = sent/delivered/read
+                base.successCount   = rc.total - rc.failed;
                 base.failureCount   = rc.failed;
-                base.deliveredCount = rc.delivered + rc.read;        // delivered still counts as delivered
+                base.deliveredCount = rc.delivered + rc.read;
                 base.readCount      = rc.read;
-            }
-            // else: campaign doc fields remain as-is (campaign still dispatching, no recipients yet)
 
+                // If 100% of recipients are delivered/read with 0 failures, campaign is completed
+                const isFullyDelivered = (rc.delivered + rc.read) >= rc.total && rc.failed === 0;
+                if (isFullyDelivered) {
+                    base.status = 'completed';
+                    if (c.status !== 'completed') {
+                        campaignLifecycleManager.completeCampaign(c.id, req.user.tenantId)
+                            .catch(err => console.warn('[campaigns] auto-complete error:', err.message));
+                    }
+                }
+            }
+
+            const isCompleted = base.status === 'completed';
             return {
                 ...base,
-                hasPendingRetry: pendingSet.has(c.id),
+                hasPendingRetry: !isCompleted && pendingSet.has(c.id),
             };
         });
 
-        res.json({ campaigns: enriched });
+        const hasMore = isPaginated ? (skip + campaigns.length < totalCampaigns) : false;
+
+        res.json({
+            campaigns: enriched,
+            totalStats,
+            totalCampaigns,
+            page,
+            limit: isPaginated ? limit : totalCampaigns,
+            hasMore
+        });
     } catch (error) {
         console.error('GET /campaigns error:', error);
         res.status(500).json({ error: 'Failed to fetch campaigns' });
@@ -3533,9 +3678,121 @@ app.get('/media/:mediaId', authenticate, async (req, res) => {
 
 app.get('/campaigns/:campaignId/recipients', authenticate, async (req, res) => {
     try {
-        const recipients = await Recipient.find({ tenantId: req.user.tenantId, campaignId: req.params.campaignId });
-        res.json(recipients);
+        const { campaignId } = req.params;
+        const tenantId = req.user.tenantId;
+
+        // Fetch all recipients for this campaign
+        const recipients = await Recipient.find({ tenantId, campaignId }).lean();
+
+        // Look up the campaign template name so we can fetch its buttons
+        const campaign = await Campaign.findOne({ tenantId, id: campaignId }).select('template').lean();
+        let templateButtons = [];
+
+        if (campaign?.template) {
+            try {
+                const tenant = await Tenant.findById(tenantId).select('whatsappConfig').lean();
+                if (tenant?.whatsappConfig?.accessToken && tenant?.whatsappConfig?.businessAccountId) {
+                    const resp = await axios.get(
+                        `${WHATSAPP_API_URL}/${tenant.whatsappConfig.businessAccountId}/message_templates`,
+                        {
+                            headers: { Authorization: `Bearer ${tenant.whatsappConfig.accessToken}` },
+                            params: { name: campaign.template }
+                        }
+                    );
+                    const tpl = (resp.data?.data || []).find(t => t.name === campaign.template);
+                    const components = tpl?.components || [];
+                    const btnComp = components.find(c => c.type === 'BUTTONS');
+                    if (btnComp?.buttons) {
+                        templateButtons = btnComp.buttons
+                            .filter(b => b.type === 'QUICK_REPLY')
+                            .map(b => ({ text: b.text, type: b.type }));
+                    }
+                }
+            } catch (tplErr) {
+                console.warn(`[recipients] Failed to fetch template buttons for campaign ${campaignId}:`, tplErr.message);
+            }
+        }
+
+        // ── Infer button clicks from Messages collection ────────────────────────
+        // EC2 saves every incoming button reply as a Message with isMe:false.
+        // We cross-reference Messages against templateButtons to find clicks.
+        if (templateButtons.length > 0 && recipients.length > 0) {
+            try {
+                const phones = [...new Set(recipients.map(r => r.to).filter(Boolean))];
+                const earliestSentAt = recipients.reduce((min, r) => {
+                    const t = r.sentAt ? new Date(r.sentAt) : null;
+                    return t && (!min || t < min) ? t : min;
+                }, null);
+
+                // Fetch all incoming messages from these recipients around or after send time
+                const queryFilter = {
+                    tenantId,
+                    contactId: { $in: phones },
+                    isMe: false,
+                };
+                if (earliestSentAt) {
+                    const bufferTime = new Date(earliestSentAt.getTime() - 60 * 1000);
+                    queryFilter.$or = [
+                        { timestamp: { $gte: bufferTime } },
+                        { time: { $gte: bufferTime.toISOString() } },
+                    ];
+                }
+
+                const buttonMessages = await Message.find(queryFilter)
+                    .select('contactId text timestamp time messageType')
+                    .lean();
+
+                // Build a map: phone → Set of clicked button texts
+                const inferredClicks = {};
+                for (const msg of buttonMessages) {
+                    const rawText = (msg.text || '').trim();
+                    const cleanTextLower = rawText.replace(/^[↩️\s]+/, '').toLowerCase();
+
+                    const matchedBtn = templateButtons.find(b => {
+                        const btnText = (b.text || '').trim().toLowerCase();
+                        return btnText && cleanTextLower === btnText;
+                    });
+
+                    if (matchedBtn) {
+                        if (!inferredClicks[msg.contactId]) inferredClicks[msg.contactId] = new Set();
+                        inferredClicks[msg.contactId].add(matchedBtn.text.trim());
+                    }
+                }
+
+                // Merge inferred clicks into recipient records and persist
+                for (const r of recipients) {
+                    const inferred = inferredClicks[r.to];
+                    if (inferred && inferred.size > 0) {
+                        const existing = new Set((r.clickedButtons || []).map(b => b.trim().toLowerCase()));
+                        const merged = [...(r.clickedButtons || [])];
+                        for (const btn of inferred) {
+                            if (!existing.has(btn.toLowerCase())) merged.push(btn);
+                        }
+                        r.clickedButtons = merged;
+
+                        // Persist to MongoDB Recipient document
+                        Recipient.findByIdAndUpdate(r._id, {
+                            $set: { clickedButtons: merged },
+                            $addToSet: {
+                                buttonClicks: {
+                                    $each: Array.from(inferred).map(text => ({
+                                        buttonText: text,
+                                        clickedAt: new Date()
+                                    }))
+                                }
+                            }
+                        }).catch(e => console.warn('[recipients] click persist error:', e.message));
+                    }
+                }
+            } catch (inferErr) {
+                console.warn('[recipients] Button click inference error:', inferErr.message);
+            }
+        }
+        // ── End button click inference ──────────────────────────────────────────
+
+        res.json({ recipients, templateButtons });
     } catch (error) {
+        console.error('[/campaigns/:campaignId/recipients] error:', error.message);
         res.status(500).json({ error: 'Failed to fetch recipients' });
     }
 });
@@ -6170,305 +6427,164 @@ async function handleLiveChat(tenantId, message, profileName, from) {
     }
 }
 
-//  Incoming Webhook (Messages & Status Updates) 
-app.post('/webhook', async (req, res) => {
-    const body = req.body;
-    console.log(' Incoming Webhook:', JSON.stringify(body, null, 2));
-
-    // ── Instagram DM Webhook (Handled in services/instagramWebhookService) ──
-    if (body.object === 'instagram' || body.object === 'page') {
-        return handleInstagramWebhook(req, res, body, Tenant, InstagramAutomation, InstagramAutomationSession);
-    }
-
-    if (body.object !== 'whatsapp_business_account') return res.sendStatus(404);
-
-    // ── Step 3: Handle account_update PARTNER_ADDED event & message_template_status_update ──
-    for (const entry of body.entry || []) {
-        for (const change of entry.changes || []) {
-            const val = change.value;
-            if (change.field === 'account_update' && val?.event === 'PARTNER_ADDED') {
-                res.sendStatus(200); // Respond immediately to Meta
-                const wabaId = val.waba_id || entry.id;
-                const businessPortfolioId = val.business_portfolio_id || null;
-
+// Register handlers in WebhookIngestionService
+webhookIngestionService.setHandler(async (body, ctx) => {
+    return processIncomingWebhookPayload(body, {
+        processStatusUpdateAtomic: (statusUpdate) => messageTracker.processStatusUpdateAtomic(statusUpdate, {
+            Recipient,
+            StatusMapping,
+            Campaign,
+            Message,
+            broadcastMessages,
+            broadcastCampaigns,
+            messageTracker
+        }),
+        handlePartnerAdded: async (wabaId, val) => {
+            const businessPortfolioId = val?.business_portfolio_id || null;
+            await saveOnboardingLog({
+                tenantId: null,
+                sessionId: null,
+                wabaId,
+                businessPortfolioId,
+                step: 'WEBHOOK_PARTNER_ADDED',
+                status: 'info',
+                message: `Received account_update PARTNER_ADDED webhook from Meta. Triggering background onboarding...`,
+                details: val
+            });
+            processOnboarding(wabaId, businessPortfolioId, null).catch(async (err) => {
                 await saveOnboardingLog({
                     tenantId: null,
                     sessionId: null,
                     wabaId,
                     businessPortfolioId,
-                    step: 'WEBHOOK_PARTNER_ADDED',
-                    status: 'info',
-                    message: `Received account_update PARTNER_ADDED webhook from Meta. Triggering background onboarding...`,
-                    details: val
+                    step: 'WEBHOOK_PROCESS_ONBOARDING_FAIL',
+                    status: 'error',
+                    message: `Background onboarding triggered by webhook failed: ${err.message}`,
+                    details: err.stack
                 });
+            });
+        },
+        handleTemplateStatusUpdate: async (wabaId, val) => {
+            const templateName = val?.message_template_name;
+            const eventStatus = val?.event;
+            const reason = val?.reason || null;
+            const lang = val?.message_template_language || null;
+            console.log(`[Webhook] Template Status Update for WABA ${wabaId}: ${templateName} -> ${eventStatus} (Reason: ${reason})`);
 
-                // Trigger Steps 4→5→6 asynchronously (null tenantId = match by WABA ID)
-                processOnboarding(wabaId, businessPortfolioId, null).catch(async (err) => {
-                    await saveOnboardingLog({
-                        tenantId: null,
-                        sessionId: null,
-                        wabaId,
-                        businessPortfolioId,
-                        step: 'WEBHOOK_PROCESS_ONBOARDING_FAIL',
-                        status: 'error',
-                        message: `Background onboarding triggered by webhook failed: ${err.message}`,
-                        details: err.stack
-                    });
-                });
-                return; // already sent 200
-            }
-
-            if (change.field === 'message_template_status_update') {
-                res.sendStatus(200); // Respond immediately to Meta
-                const wabaId = entry.id;
-                const templateName = val?.message_template_name;
-                const eventStatus = val?.event; // APPROVED / REJECTED / PENDING / etc.
-                const reason = val?.reason || null;
-                const lang = val?.message_template_language || null;
-
-                console.log(`[Webhook] Template Status Update for WABA ${wabaId}: ${templateName} -> ${eventStatus} (Reason: ${reason})`);
-
-                Tenant.findOne({ 'whatsappConfig.businessAccountId': wabaId }).then(async (tenant) => {
-                    if (tenant) {
-                        const tenantId = tenant._id.toString();
-                        
-                        // Update our local cache of template rejection reasons if template was rejected
-                        if (eventStatus === 'REJECTED' && reason) {
-                            if (!tenant.whatsappConfig.templateRejections) {
-                                tenant.whatsappConfig.templateRejections = new Map();
-                            }
-                            tenant.whatsappConfig.templateRejections.set(templateName, reason);
-                            await tenant.save();
-                        } else if (eventStatus === 'APPROVED') {
-                            // If it's approved, we can remove any existing rejection reason
-                            if (tenant.whatsappConfig.templateRejections) {
-                                tenant.whatsappConfig.templateRejections.delete(templateName);
-                                await tenant.save();
-                            }
-                        }
-
-                        // Emit socket event to notify frontend
-                        io.to(tenantId).emit('template_status_update', {
-                            name: templateName,
-                            status: eventStatus,
-                            reason: reason,
-                            language: lang
-                        });
-                        console.log(`[Webhook] Emitted template_status_update to tenant ${tenantId}`);
-
-                        // Trigger In-App & FCM Push Notification
-                        try {
-                            const isApproved = eventStatus === 'APPROVED';
-                            await NotificationService.create({
-                                tenantId,
-                                title: isApproved ? '✅ Template Approved' : '❌ Template Rejected',
-                                body: isApproved 
-                                    ? `Template "${templateName}" was approved by Meta!`
-                                    : `Template "${templateName}" was rejected by Meta. Reason: ${reason || 'Policy violation'}`,
-                                type: 'system',
-                                category: 'system',
-                                actionData: { screen: 'templates' }
-                            });
-                        } catch (notifErr) {
-                            console.error('[Webhook] Failed to create template status notification:', notifErr.message);
-                        }
-                    } else {
-                        console.warn(`[Webhook] Received template status update for WABA ${wabaId} but no tenant found.`);
+            const tenant = await Tenant.findOne({ 'whatsappConfig.businessAccountId': wabaId });
+            if (tenant) {
+                const tenantId = tenant._id.toString();
+                if (eventStatus === 'REJECTED' && reason) {
+                    if (!tenant.whatsappConfig.templateRejections) tenant.whatsappConfig.templateRejections = new Map();
+                    tenant.whatsappConfig.templateRejections.set(templateName, reason);
+                    await tenant.save();
+                } else if (eventStatus === 'APPROVED') {
+                    if (tenant.whatsappConfig.templateRejections) {
+                        tenant.whatsappConfig.templateRejections.delete(templateName);
+                        await tenant.save();
                     }
-                }).catch(err => {
-                    console.error('[Webhook] Error handling template status update:', err);
+                }
+                io.to(tenantId).emit('template_status_update', {
+                    name: templateName,
+                    status: eventStatus,
+                    reason: reason,
+                    language: lang
                 });
-                return; // already sent 200
+                try {
+                    const isApproved = eventStatus === 'APPROVED';
+                    await NotificationService.create({
+                        tenantId,
+                        title: isApproved ? '✅ Template Approved' : '❌ Template Rejected',
+                        body: isApproved 
+                            ? `Template "${templateName}" was approved by Meta!`
+                            : `Template "${templateName}" was rejected by Meta. Reason: ${reason || 'Policy violation'}`,
+                        type: 'system',
+                        category: 'system',
+                        actionData: { screen: 'templates' }
+                    });
+                } catch (notifErr) {
+                    console.error('[Webhook] Failed to create template status notification:', notifErr.message);
+                }
             }
+        },
+        handlePhoneNumberNameUpdate: async (val) => {
+            const phoneNumberId = val?.display_phone_number_id || val?.phone_number_id;
+            const decision = val?.decision;
+            const requestedName = val?.requested_verified_name;
+            console.log(`[Webhook] phone_number_name_update for Phone ID ${phoneNumberId}: decision=${decision}, name=${requestedName}`);
 
-            if (change.field === 'phone_number_name_update') {
-                res.sendStatus(200); // Respond immediately to Meta
-                const phoneNumberId = val?.display_phone_number_id || val?.phone_number_id;
-                const decision = val?.decision; // APPROVED | DECLINED
-                const requestedName = val?.requested_verified_name;
-
-                console.log(`[Webhook] phone_number_name_update for Phone ID ${phoneNumberId}: decision=${decision}, name=${requestedName}`);
-
-                Tenant.findOne({ 'whatsappConfig.phoneNumberId': phoneNumberId }).then(async (tenant) => {
-                    if (tenant) {
-                        const tenantId = tenant._id.toString();
-                        const accessToken = tenant.whatsappConfig.accessToken;
-
+            const tenant = await Tenant.findOne({ 'whatsappConfig.phoneNumberId': phoneNumberId });
+            if (tenant) {
+                const tenantId = tenant._id.toString();
+                const accessToken = tenant.whatsappConfig.accessToken;
+                await Tenant.findByIdAndUpdate(tenantId, {
+                    $set: {
+                        'whatsappConfig.nameApprovalStatus': decision,
+                        'whatsappConfig.verifiedName': requestedName || tenant.whatsappConfig.verifiedName,
+                    }
+                });
+                if (decision === 'APPROVED' && accessToken) {
+                    const regResult = await registerPhoneNumber(phoneNumberId, accessToken, tenant.whatsappConfig.registrationPin || '123456');
+                    if (regResult.success) {
                         await Tenant.findByIdAndUpdate(tenantId, {
                             $set: {
-                                'whatsappConfig.nameApprovalStatus': decision,
-                                'whatsappConfig.verifiedName': requestedName || tenant.whatsappConfig.verifiedName,
+                                'whatsappConfig.phoneStatus': 'CONNECTED',
+                                'whatsappConfig.verified': true,
+                                'whatsappConfig.registrationError': null,
                             }
                         });
-
-                        if (decision === 'APPROVED' && accessToken) {
-                            console.log(`[Webhook] Display name APPROVED for Phone ID ${phoneNumberId}. Triggering auto-registration...`);
-                            const regResult = await registerPhoneNumber(phoneNumberId, accessToken, tenant.whatsappConfig.registrationPin || '123456');
-
-                            if (regResult.success) {
-                                await Tenant.findByIdAndUpdate(tenantId, {
-                                    $set: {
-                                        'whatsappConfig.phoneStatus': 'CONNECTED',
-                                        'whatsappConfig.verified': true,
-                                        'whatsappConfig.registrationError': null,
-                                    }
-                                });
-                                console.log(`[Webhook] ✅ Phone ID ${phoneNumberId} auto-registered and CONNECTED upon name approval.`);
-                            } else {
-                                await Tenant.findByIdAndUpdate(tenantId, {
-                                    $set: {
-                                        'whatsappConfig.registrationError': regResult.error,
-                                    }
-                                });
-                                console.error(`[Webhook] ❌ Phone ID ${phoneNumberId} auto-registration failed:`, regResult.error);
-                            }
-                        }
+                        console.log(`[Webhook] ✅ Phone ID ${phoneNumberId} auto-registered and CONNECTED upon name approval.`);
                     } else {
-                        console.warn(`[Webhook] Received phone_number_name_update for Phone ID ${phoneNumberId} but no tenant found.`);
-                    }
-                }).catch(err => {
-                    console.error('[Webhook] Error handling phone_number_name_update:', err);
-                });
-                return; // already sent 200
-            }
-        }
-    }
-
-    try {
-        const entry = body.entry[0];
-        const value = entry.changes[0].value;
-        const receiverPhoneNumberId = value.metadata?.phone_number_id;
-
-
-        // Handle Status Updates
-        if (value.statuses) {
-            const statusUpdate = value.statuses[0];
-            const wamid = statusUpdate.id;
-            const status = statusUpdate.status;
-            if (!wamid) return res.sendStatus(200);
-
-            console.log(JSON.stringify({
-                service: 'webhook',
-                event: 'delivery_status_received',
-                wamid,
-                status,
-                timestamp: new Date().toISOString()
-            }));
-
-            const mapping = await StatusMapping.findOne({ wamid });
-            if (mapping?.tenantId) {
-                // Update Message delivery status and details in DB
-                const messageUpdate = { status };
-                if (statusUpdate.errors && statusUpdate.errors.length > 0) {
-                    const err = statusUpdate.errors[0];
-                    messageUpdate.errorDetails = err.error_data?.details || err.message || err.title || 'Unknown Meta error';
-                }
-                await Message.findOneAndUpdate({ wamid }, { $set: messageUpdate });
-                await broadcastMessages(mapping.tenantId, mapping.to);
-
-                if (mapping.campaignId) {
-                    const filter = { tenantId: mapping.tenantId, id: mapping.campaignId };
-
-                    if (status === 'delivered') {
-                        await Campaign.findOneAndUpdate(filter, { $inc: { deliveredCount: 1 } });
-                    } else if (status === 'read') {
-                        // Meta sometimes sends 'read' without a prior 'delivered' webhook,
-                        // which would make deliveredCount go negative. Use an aggregation
-                        // pipeline update to clamp deliveredCount to 0 at minimum.
-                        await Campaign.findOneAndUpdate(filter, [
-                            {
-                                $set: {
-                                    readCount: { $add: ['$readCount', 1] },
-                                    deliveredCount: { $max: [0, { $subtract: ['$deliveredCount', 1] }] }
-                                }
+                        await Tenant.findByIdAndUpdate(tenantId, {
+                            $set: {
+                                'whatsappConfig.registrationError': regResult.error,
                             }
-                        ]);
-                    } else if (status === 'failed') {
-                        // Note: failureCount here = delivery failures (message failed AFTER being sent to Meta).
-                        // successCount is NOT decremented — it remains the API-acceptance count (how many
-                        // we submitted to Meta), matching the industry standard used by WATI and AiSensy.
-                        await Campaign.findOneAndUpdate(filter, { $inc: { failureCount: 1 } });
+                        });
+                        console.error(`[Webhook] ❌ Phone ID ${phoneNumberId} auto-registration failed:`, regResult.error);
                     }
-                }
-
-                if (mapping.campaignId) {
-                    const recipientUpdate = { status };
-                    if (status === 'delivered') recipientUpdate.deliveredAt = new Date().toISOString();
-                    if (status === 'read') recipientUpdate.readAt = new Date().toISOString();
-                    if (status === 'failed') recipientUpdate.failedAt = new Date().toISOString();
-                    await Recipient.findOneAndUpdate({ wamid }, { $set: recipientUpdate });
-
-                    // Phase tracking: record delivery phase for successfully delivered messages.
-                    // recordDelivery is idempotent — it only sets phaseNumber when it is still null,
-                    // so duplicate webhooks and delayed webhooks are handled safely.
-                    if (status === 'delivered' || status === 'read') {
-                        try {
-                            const campaign = await Campaign.findOne(
-                                { tenantId: mapping.tenantId, id: mapping.campaignId },
-                                { currentPhase: 1 }
-                            );
-                            if (campaign) {
-                                const deliveryTimestamp = statusUpdate.timestamp
-                                    ? new Date(parseInt(statusUpdate.timestamp, 10) * 1000)
-                                    : new Date();
-                                await messageTracker.recordDelivery(
-                                    wamid,
-                                    campaign.currentPhase,
-                                    deliveryTimestamp
-                                );
-                                console.log(JSON.stringify({
-                                    service: 'webhook',
-                                    event: 'delivery_phase_recorded',
-                                    wamid,
-                                    campaignId: mapping.campaignId,
-                                    phaseNumber: campaign.currentPhase,
-                                    deliveryStatus: status,
-                                    timestamp: new Date().toISOString()
-                                }));
-                            }
-                        } catch (trackErr) {
-                            // Non-fatal: log but don't fail the webhook response
-                            console.error(JSON.stringify({
-                                service: 'webhook',
-                                event: 'delivery_phase_record_failed',
-                                wamid,
-                                campaignId: mapping.campaignId,
-                                error: trackErr.message,
-                                stack: trackErr.stack,
-                                timestamp: new Date().toISOString()
-                            }));
-                        }
-                    }
-
-                    await broadcastCampaigns(mapping.tenantId);
                 }
             }
-        }
-
-        // Handle Incoming Messages
-        if (value.messages) {
+        },
+        processIncomingMessage: async (message, contacts, receiverPhoneNumberId) => {
             let tenantId = null;
             let tenant = null;
             if (receiverPhoneNumberId) {
                 tenant = await Tenant.findOne({ 'whatsappConfig.phoneNumberId': receiverPhoneNumberId });
                 if (tenant) tenantId = tenant._id.toString();
             }
-
             if (!tenantId) {
                 console.warn(` Could not map incoming message to a tenant (Phone: ${receiverPhoneNumberId})`);
             } else {
-                const message = value.messages[0];
                 const from = message.from;
-                const profileName = value.contacts?.[0]?.profile?.name || 'Unknown Sender';
-
+                const profileName = contacts?.[0]?.profile?.name || 'Unknown Sender';
                 await chatbotEngineProcessMessage(tenantId, message, profileName, from, tenant);
             }
         }
+    });
+});
 
-        res.sendStatus(200);
-    } catch (error) {
-        console.error(' Error processing webhook:', error);
-        res.sendStatus(500);
+//  Incoming Webhook (Messages & Status Updates) 
+app.post('/webhook', verifyMetaWebhookSignature, async (req, res) => {
+    const body = req.body;
+     // ── Instagram DM Webhook (Handled in services/instagramWebhookService) ──
+    if (body.object === 'instagram' || body.object === 'page') {
+        return handleInstagramWebhook(req, res, body, Tenant, InstagramAutomation, InstagramAutomationSession);
+    }
+    if (body.object !== 'whatsapp_business_account') return res.sendStatus(404);
+
+    let rawLogId = null;
+    try {
+        rawLogId = await webhookIngestionService.enqueueRawWebhook(body);
+    } catch (err) {
+        console.error('[Webhook] Failed to write-ahead enqueue raw webhook:', err.message);
+    }
+
+    // Immediate acknowledgment within SLA (< 50ms)
+    res.status(200).send('EVENT_RECEIVED');
+
+    // Process asynchronously in background
+    if (rawLogId) {
+        setImmediate(() => webhookIngestionService.processWebhookJob(rawLogId));
     }
 });
 
@@ -8094,6 +8210,99 @@ Respond with ONLY a valid JSON object in this exact format (no markdown, no extr
  *
  * Requirements: 10.3, 10.4
  */
+// ── TEMP DEBUG: check button click state for a phone number ──────────────────
+// Usage: GET /api/debug/button-clicks/PHONE_NUMBER  (no auth for quick debugging)
+app.get('/api/debug/campaign-recipients/:campaignId', async (req, res) => {
+    try {
+        const { campaignId } = req.params;
+        const recipients = await Recipient.find({ campaignId }).lean();
+        const campaign = await Campaign.findOne({ id: campaignId }).select('template tenantId').lean();
+        const tenantId = campaign?.tenantId || recipients[0]?.tenantId;
+
+        let templateButtons = [];
+        if (campaign?.template) {
+            try {
+                const tenant = await Tenant.findById(tenantId).select('whatsappConfig').lean();
+                if (tenant?.whatsappConfig?.accessToken && tenant?.whatsappConfig?.businessAccountId) {
+                    const resp = await axios.get(
+                        `${WHATSAPP_API_URL}/${tenant.whatsappConfig.businessAccountId}/message_templates`,
+                        {
+                            headers: { Authorization: `Bearer ${tenant.whatsappConfig.accessToken}` },
+                            params: { name: campaign.template }
+                        }
+                    );
+                    const tpl = (resp.data?.data || []).find(t => t.name === campaign.template);
+                    const components = tpl?.components || [];
+                    const btnComp = components.find(c => c.type === 'BUTTONS');
+                    if (btnComp?.buttons) {
+                        templateButtons = btnComp.buttons
+                            .filter(b => b.type === 'QUICK_REPLY')
+                            .map(b => ({ text: b.text, type: b.type }));
+                    }
+                }
+            } catch (tplErr) {
+                console.warn('[debug] template fetch error:', tplErr.message);
+            }
+        }
+
+        // Run inference
+        if (templateButtons.length > 0 && recipients.length > 0) {
+            const phones = [...new Set(recipients.map(r => r.to).filter(Boolean))];
+            const buttonMessages = await Message.find({
+                contactId: { $in: phones },
+                isMe: false,
+            }).select('contactId text timestamp time messageType').lean();
+
+            const inferredClicks = {};
+            for (const msg of buttonMessages) {
+                const rawText = (msg.text || '').trim();
+                const cleanTextLower = rawText.replace(/^[↩️\s]+/, '').toLowerCase();
+                const matchedBtn = templateButtons.find(b => {
+                    const btnText = (b.text || '').trim().toLowerCase();
+                    return btnText && cleanTextLower === btnText;
+                });
+                if (matchedBtn) {
+                    if (!inferredClicks[msg.contactId]) inferredClicks[msg.contactId] = new Set();
+                    inferredClicks[msg.contactId].add(matchedBtn.text.trim());
+                }
+            }
+
+            for (const r of recipients) {
+                const inferred = inferredClicks[r.to];
+                if (inferred && inferred.size > 0) {
+                    const existing = new Set((r.clickedButtons || []).map(b => b.trim().toLowerCase()));
+                    const merged = [...(r.clickedButtons || [])];
+                    for (const btn of inferred) {
+                        if (!existing.has(btn.toLowerCase())) merged.push(btn);
+                    }
+                    r.clickedButtons = merged;
+                }
+            }
+        }
+
+        res.json({ campaign, templateButtons, recipients });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/debug/button-clicks/:phone', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const recipients = await Recipient.find({ to: phone })
+            .sort({ _id: -1 }).limit(5)
+            .select('to status campaignId tenantId wamid clickedButtons buttonClicks sentAt')
+            .lean();
+        const messages = await Message.find({ contactId: phone })
+            .sort({ _id: -1 }).limit(10)
+            .select('contactId text isMe messageType source timestamp time')
+            .lean();
+        res.json({ phone, recipients, messages });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/api/admin/retry-system/health', authenticate, async (req, res) => {
     try {
         const now = new Date();
@@ -8965,6 +9174,287 @@ app.get('/api/superadmin/dashboard-stats', authenticateSuperAdmin, async (req, r
     } catch (err) {
         console.error('[SuperAdmin] dashboard-stats error:', err.message);
         res.status(500).json({ error: 'Failed to fetch dashboard stats', details: err.message });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  APP VERSION & APK SELF-UPDATE MODULE
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── APK Storage Configuration ────────────────────────────────────────────────
+const apkUploadDir = path.join(__dirname, 'uploads', 'apk');
+if (!fs.existsSync(apkUploadDir)) {
+    fs.mkdirSync(apkUploadDir, { recursive: true });
+}
+
+const apkStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, apkUploadDir);
+    },
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        const safeName = `temp-${Date.now()}-${Math.round(Math.random() * 1E6)}${ext}`;
+        cb(null, safeName);
+    }
+});
+
+const apkUpload = multer({
+    storage: apkStorage,
+    limits: { fileSize: 300 * 1024 * 1024 }, // 300MB limit
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (ext !== '.apk') {
+            return cb(new Error('Only .apk files are allowed'));
+        }
+        cb(null, true);
+    }
+});
+
+// ── Admin Authentication Helper for App Updates ──────────────────────────────
+const authenticateAdminOrSecret = (req, res, next) => {
+    // 1. Check admin secret header or query
+    const secret = req.headers['x-admin-secret'] || req.headers['admin-secret'] || req.query.secret || req.body?.secret;
+    const adminSecret = process.env.ADMIN_UPDATE_SECRET || 'sendzyy-update-secret-9988';
+    if (secret && secret === adminSecret) {
+        return next();
+    }
+
+    // 2. Check Super Admin JWT token
+    const token = req.headers['authorization']?.split(' ')[1] || req.query.token;
+    if (token) {
+        const superSecret = process.env.SUPERADMIN_JWT_SECRET || 'sendzyy-superadmin-secret-change-me';
+        return jwt.verify(token, superSecret, (err, decoded) => {
+            if (!err && decoded && decoded.role === 'superadmin') {
+                req.superAdmin = decoded;
+                return next();
+            }
+            return res.status(403).json({ success: false, error: 'Forbidden: Invalid or expired super admin credentials' });
+        });
+    }
+
+    return res.status(401).json({ success: false, error: 'Unauthorized: Admin credentials or token required' });
+};
+
+// ── 1. GET /api/app/version (Public) ──────────────────────────────────────────
+// Returns the latest active Android release metadata
+app.get('/api/app/version', async (req, res) => {
+    try {
+        const platform = (req.query.platform || 'android').toLowerCase();
+        const latest = await AppVersion.findOne({ platform, isActive: true })
+            .sort({ buildNumber: -1, createdAt: -1 });
+
+        if (!latest) {
+            return res.json({
+                success: true,
+                data: null,
+                message: 'No active release found'
+            });
+        }
+
+        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        const apkDownloadUrl = latest.apkUrl.startsWith('http')
+            ? latest.apkUrl
+            : `${baseUrl}${latest.apkUrl.startsWith('/') ? '' : '/'}${latest.apkUrl}`;
+
+        res.json({
+            success: true,
+            data: {
+                platform: latest.platform,
+                version: latest.version,
+                buildNumber: latest.buildNumber,
+                apkUrl: apkDownloadUrl,
+                apkFileName: latest.apkFileName,
+                sha256: latest.sha256,
+                forceUpdate: latest.forceUpdate,
+                releaseNotes: latest.releaseNotes || [],
+                fileSize: latest.fileSize || 0,
+                updatedAt: latest.updatedAt,
+            }
+        });
+    } catch (err) {
+        console.error('[AppUpdate] GET /api/app/version error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to retrieve version information', details: err.message });
+    }
+});
+
+// ── 2. GET /api/app/download/android (Public) ─────────────────────────────────
+// Streams/downloads the active Android APK
+app.get('/api/app/download/android', async (req, res) => {
+    try {
+        const latest = await AppVersion.findOne({ platform: 'android', isActive: true })
+            .sort({ buildNumber: -1, createdAt: -1 });
+
+        if (!latest) {
+            return res.status(404).json({ success: false, error: 'No active release found' });
+        }
+
+        const filePath = path.join(apkUploadDir, latest.apkFileName);
+        if (!fs.existsSync(filePath)) {
+            console.error(`[AppUpdate] APK file not found on disk: ${filePath}`);
+            return res.status(404).json({ success: false, error: 'APK binary file not found on server' });
+        }
+
+        res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+        res.setHeader('Content-Disposition', `attachment; filename="${latest.apkFileName}"`);
+        res.setHeader('Content-Length', fs.statSync(filePath).size);
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+
+        const stream = fs.createReadStream(filePath);
+        stream.pipe(res);
+    } catch (err) {
+        console.error('[AppUpdate] GET /api/app/download/android error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to download APK', details: err.message });
+    }
+});
+
+// ── 3. POST /api/admin/app-version (Admin/SuperAdmin) ──────────────────────────
+// Uploads new APK release with validation and SHA-256 calculation
+app.post('/api/admin/app-version', authenticateAdminOrSecret, apkUpload.single('apk'), async (req, res) => {
+    let uploadedTempPath = req.file?.path;
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, message: 'APK file is required (form-data field: apk)' });
+        }
+
+        const { version, buildNumber, forceUpdate } = req.body;
+        let releaseNotes = req.body.releaseNotes;
+
+        if (!version || !buildNumber) {
+            if (uploadedTempPath && fs.existsSync(uploadedTempPath)) fs.unlinkSync(uploadedTempPath);
+            return res.status(400).json({ success: false, message: 'Version (e.g. 1.0.1) and buildNumber (integer) are required' });
+        }
+
+        // Validate semver format
+        const cleanVersion = String(version).trim();
+        if (!/^\d+(\.\d+)+$/.test(cleanVersion)) {
+            if (uploadedTempPath && fs.existsSync(uploadedTempPath)) fs.unlinkSync(uploadedTempPath);
+            return res.status(400).json({ success: false, message: 'Version must follow standard format (e.g. 1.0.1)' });
+        }
+
+        // Validate positive build number
+        const parsedBuild = parseInt(buildNumber, 10);
+        if (isNaN(parsedBuild) || parsedBuild <= 0) {
+            if (uploadedTempPath && fs.existsSync(uploadedTempPath)) fs.unlinkSync(uploadedTempPath);
+            return res.status(400).json({ success: false, message: 'buildNumber must be a positive integer' });
+        }
+
+        // Parse release notes
+        let parsedNotes = [];
+        if (Array.isArray(releaseNotes)) {
+            parsedNotes = releaseNotes.map(n => String(n).trim()).filter(Boolean);
+        } else if (typeof releaseNotes === 'string') {
+            try {
+                const parsed = JSON.parse(releaseNotes);
+                parsedNotes = Array.isArray(parsed) ? parsed : [releaseNotes];
+            } catch (_) {
+                parsedNotes = releaseNotes.split('\n').map(n => n.trim().replace(/^[-*•]\s*/, '')).filter(Boolean);
+            }
+        }
+
+        const isForceUpdate = forceUpdate === true || forceUpdate === 'true' || forceUpdate === '1';
+
+        // Check current active version to prevent downgrade
+        const currentActive = await AppVersion.findOne({ platform: 'android', isActive: true })
+            .sort({ buildNumber: -1 });
+
+        if (currentActive && parsedBuild <= currentActive.buildNumber) {
+            if (uploadedTempPath && fs.existsSync(uploadedTempPath)) fs.unlinkSync(uploadedTempPath);
+            return res.status(400).json({
+                success: false,
+                message: `Build number must be greater than current active build number (${currentActive.buildNumber}). Downgrades are rejected.`
+            });
+        }
+
+        // Calculate SHA-256 checksum of the uploaded APK
+        const fileBuffer = fs.readFileSync(uploadedTempPath);
+        const computedSha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+        const fileSize = fileBuffer.length;
+
+        // Clean target filename
+        const finalApkFileName = `sendzyy-${cleanVersion}-${parsedBuild}.apk`;
+        const finalApkPath = path.join(apkUploadDir, finalApkFileName);
+
+        // Move/rename temp file to final location
+        fs.renameSync(uploadedTempPath, finalApkPath);
+        uploadedTempPath = null; // Cleared
+
+        // Deactivate older releases
+        await AppVersion.updateMany({ platform: 'android' }, { isActive: false });
+
+        // Create new release document
+        const newRelease = new AppVersion({
+            platform: 'android',
+            version: cleanVersion,
+            buildNumber: parsedBuild,
+            apkUrl: '/api/app/download/android',
+            apkFileName: finalApkFileName,
+            sha256: computedSha256,
+            forceUpdate: isForceUpdate,
+            releaseNotes: parsedNotes,
+            fileSize: fileSize,
+            isActive: true,
+        });
+
+        await newRelease.save();
+
+        console.log(`[AppUpdate] ✅ New Android release published: v${cleanVersion} (Build ${parsedBuild}) — SHA256: ${computedSha256}`);
+
+        res.status(201).json({
+            success: true,
+            message: 'New version published successfully',
+            data: newRelease,
+        });
+    } catch (err) {
+        if (uploadedTempPath && fs.existsSync(uploadedTempPath)) {
+            try { fs.unlinkSync(uploadedTempPath); } catch (_) {}
+        }
+        console.error('[AppUpdate] POST /api/admin/app-version error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to upload and publish new APK', details: err.message });
+    }
+});
+
+// ── 4. GET /api/admin/app-versions (Admin/SuperAdmin) ──────────────────────────
+// Lists all release history
+app.get('/api/admin/app-versions', authenticateAdminOrSecret, async (req, res) => {
+    try {
+        const platform = (req.query.platform || 'android').toLowerCase();
+        const releases = await AppVersion.find({ platform }).sort({ buildNumber: -1, createdAt: -1 });
+        res.json({
+            success: true,
+            count: releases.length,
+            data: releases,
+        });
+    } catch (err) {
+        console.error('[AppUpdate] GET /api/admin/app-versions error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to fetch release history', details: err.message });
+    }
+});
+
+// ── 5. PATCH /api/admin/app-version/:id (Admin/SuperAdmin) ─────────────────────
+// Toggles forceUpdate or active status on an existing release
+app.patch('/api/admin/app-version/:id', authenticateAdminOrSecret, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { forceUpdate, isActive, releaseNotes } = req.body;
+
+        const updateData = {};
+        if (typeof forceUpdate !== 'undefined') updateData.forceUpdate = forceUpdate === true || forceUpdate === 'true';
+        if (typeof isActive !== 'undefined') updateData.isActive = isActive === true || isActive === 'true';
+        if (Array.isArray(releaseNotes)) updateData.releaseNotes = releaseNotes;
+
+        const updated = await AppVersion.findByIdAndUpdate(id, { $set: updateData }, { new: true });
+        if (!updated) {
+            return res.status(404).json({ success: false, message: 'Release not found' });
+        }
+
+        res.json({
+            success: true,
+            message: 'Release updated successfully',
+            data: updated,
+        });
+    } catch (err) {
+        console.error('[AppUpdate] PATCH /api/admin/app-version/:id error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to update release', details: err.message });
     }
 });
 
