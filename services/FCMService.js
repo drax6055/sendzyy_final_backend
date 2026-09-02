@@ -74,7 +74,8 @@ function buildPayload({ title, body, data = {}, imageUrl = null }) {
                 aps: {
                     alert: { title, body },
                     sound: 'default',
-                    badge: 1
+                    badge: 1,
+                    contentAvailable: true
                 }
             }
         },

@@ -1768,14 +1768,6 @@ app.post('/api/notifications/register-token', async (req, res) => {
             { upsert: true, new: true }
         );
 
-        // Deactivate or remove any old stale tokens for the same deviceId
-        if (deviceId) {
-            await FCMToken.deleteMany({
-                deviceId,
-                token: { $ne: token }
-            });
-        }
-
         // Subscribe device token to tenant FCM topic
         await FCMService.subscribeToTenantTopic(token, tenantId);
 
