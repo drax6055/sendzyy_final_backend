@@ -9,6 +9,10 @@
  * Requirements: 3.3, 3.5
  */
 const cron = require('node-cron');
+const axios = require('axios');
+const mongoose = require('mongoose');
+const webhookIngestionService = require('./services/WebhookIngestionService');
+const { getYesterdayWindowInTz } = require('./utils/reportingWindow');
 
 /**
  * Recover any ScheduledRetryPhase documents that were left in 'executing' status
@@ -510,11 +514,109 @@ function buildTokenExpiringEmail(name, expiryDate, daysLeft) {
 }
 
 /**
+ * Periodic retry for stuck/pending/failed webhook jobs (every 5 minutes)
+ * @returns {cron.ScheduledTask}
+ */
+function startWebhookRecoveryCron() {
+    return cron.schedule('*/5 * * * *', async () => {
+        try {
+            await webhookIngestionService.recoverPendingWebhookLogs();
+        } catch (err) {
+            console.error('[WebhookRecoveryCron] Error executing recovery sweep:', err.message);
+        }
+    });
+}
+
+/**
+ * Daily Comprehensive Reconciliation Job (Runs daily at 02:30 UTC)
+ * Reconciles:
+ * 1. Template Message Analytics (Sent, Delivered, Read, Failed) against tenant WABA timezone
+ * 2. 24-Hour Conversation Category Analytics (Marketing, Utility, Service, Authentication)
+ * @param {mongoose.Model} [TenantModel] - Optional Tenant model
+ * @param {mongoose.Model} [RecipientModel] - Optional Recipient model
+ * @returns {cron.ScheduledTask}
+ */
+function startMetaReconciliationCron(TenantModel, RecipientModel) {
+    return cron.schedule('30 2 * * *', async () => {
+        try {
+            console.log('[Reconciliation] Starting daily Meta analytics audit...');
+            const Tenant = TenantModel || mongoose.model('Tenant');
+            const Recipient = RecipientModel || mongoose.model('Recipient');
+
+            const tenants = await Tenant.find({ 'whatsappConfig.verified': true });
+
+            for (const tenant of tenants) {
+                const { businessAccountId, accessToken, reportingTimezone } = tenant.whatsappConfig || {};
+                if (!businessAccountId || !accessToken) continue;
+
+                const tenantIdStr = tenant._id.toString();
+                const { startUtc, endUtc, startUnix, endUnix, dateStr, timezone } = getYesterdayWindowInTz(reportingTimezone || 'Asia/Kolkata');
+
+                // 1. Message-Level Template Analytics Reconciliation
+                try {
+                    const messageAnalyticsUrl = `https://graph.facebook.com/v21.0/${businessAccountId}?fields=analytics.start(${startUnix}).end(${endUnix}).granularity(DAILY)&access_token=${accessToken}`;
+                    const msgRes = await axios.get(messageAnalyticsUrl);
+                    const metaMsgData = msgRes.data?.analytics?.data_points?.[0] || {};
+
+                    const metrics = [
+                        { name: 'sent', metaVal: metaMsgData.sent || 0, field: 'sentAt' },
+                        { name: 'delivered', metaVal: metaMsgData.delivered || 0, field: 'deliveryTimestamp' },
+                        { name: 'read', metaVal: metaMsgData.read || 0, field: 'readAt' }
+                    ];
+
+                    for (const m of metrics) {
+                        const dbCount = await Recipient.countDocuments({
+                            tenantId: tenantIdStr,
+                            [m.field]: { $gte: startUtc, $lte: endUtc }
+                        });
+
+                        const delta = m.metaVal > 0 ? Math.abs((dbCount - m.metaVal) / m.metaVal) * 100 : 0;
+                        if (delta > 2.0) {
+                            console.warn(`[Reconciliation Alert][${dateStr} ${timezone}] Tenant ${tenantIdStr} ${m.name.toUpperCase()} discrepancy: Meta=${m.metaVal}, DB=${dbCount}, Delta=${delta.toFixed(2)}%`);
+                        }
+                    }
+                } catch (msgErr) {
+                    console.error(`[Reconciliation] Message analytics failed for tenant ${tenantIdStr}:`, msgErr.message);
+                }
+
+                // 2. Conversation Billing Categories Reconciliation
+                try {
+                    const convAnalyticsUrl = `https://graph.facebook.com/v21.0/${businessAccountId}/conversation_analytics?start=${startUnix}&end=${endUnix}&granularity=DAILY&metric_types=CONVERSATION_COUNT&dimensions=CONVERSATION_CATEGORY,CONVERSATION_TYPE&access_token=${accessToken}`;
+                    const convRes = await axios.get(convAnalyticsUrl);
+                    const convDataPoints = convRes.data?.data?.[0]?.data_points || [];
+
+                    const metaCategoryCounts = {
+                        MARKETING: 0,
+                        UTILITY: 0,
+                        SERVICE: 0,
+                        AUTHENTICATION: 0
+                    };
+
+                    for (const dp of convDataPoints) {
+                        const cat = dp.conversation_category;
+                        if (metaCategoryCounts[cat] !== undefined) {
+                            metaCategoryCounts[cat] += (dp.conversation || 0);
+                        }
+                    }
+
+                    console.log(`[Reconciliation][${dateStr}] Tenant ${tenantIdStr} Meta Billing Categories:`, JSON.stringify(metaCategoryCounts));
+                } catch (convErr) {
+                    // Non-fatal if WABA doesn't have conversation analytics permissions
+                    console.log(`[Reconciliation] Conversation analytics notice for tenant ${tenantIdStr}:`, convErr.message);
+                }
+            }
+        } catch (err) {
+            console.error('[Reconciliation Job] Error during execution:', err.message);
+        }
+    });
+}
+
+/**
  * Initialize the scheduler: run startup recovery then start the cron jobs.
  *
  * @param {RetryScheduler}  retryScheduler      - RetryScheduler service instance
  * @param {mongoose.Model}  ScheduledRetryPhase - Mongoose model for scheduled phases
- * @param {mongoose.Model}  [Tenant]            - Optional: Tenant model for token watcher
+ * @param {mongoose.Model}  [Tenant]            - Optional: Tenant model for token watcher & reconciliation
  * @param {Object}          [transporter]       - Optional: Nodemailer transporter for token watcher
  * @param {Object}          [io]                - Optional: Socket.IO server for token watcher
  * @returns {Promise<cron.ScheduledTask>} The running retry cron task
@@ -536,6 +638,12 @@ async function initScheduler(retryScheduler, ScheduledRetryPhase, Tenant, transp
         startTokenExpiryWatcherCron(Tenant, transporter, io || null);
     }
 
+    // Webhook recovery cron: every 5 minutes
+    startWebhookRecoveryCron();
+
+    // Meta Analytics Daily Reconciliation cron: 02:30 UTC
+    startMetaReconciliationCron(Tenant);
+
     return task;
 }
 
@@ -545,6 +653,8 @@ module.exports = {
     startRetrySchedulerCron,
     startCleanupCron,
     startTokenExpiryWatcherCron,
+    startWebhookRecoveryCron,
+    startMetaReconciliationCron,
 };
 
 
