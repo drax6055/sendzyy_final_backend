@@ -195,12 +195,30 @@ const NotificationService = {
             { new: true }
         );
 
+        return { notification, unreadCount };
+    },
+
+    /**
+     * Delete all notifications (soft delete) for a tenant, optionally filtered by category
+     */
+    async deleteAll(tenantId, category = null) {
+        const Notification = mongoose.model('Notification');
+        const query = { tenantId, isDeleted: false };
+        if (category && category !== 'all') {
+            query.category = category;
+        }
+
+        await Notification.updateMany(
+            query,
+            { isDeleted: true }
+        );
+
         const unreadCount = await Notification.countDocuments({ tenantId, isRead: false, isDeleted: false });
         if (SocketEmitter._io) {
             SocketEmitter._io.to(tenantId).emit('notification:count', { unreadCount });
         }
 
-        return { notification, unreadCount };
+        return { success: true, unreadCount };
     }
 };
 

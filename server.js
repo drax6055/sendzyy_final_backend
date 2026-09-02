@@ -22,6 +22,10 @@ try {
 } catch (err) {
     console.warn('Unable to set custom DNS servers:', err);
 }
+const { verifyMetaWebhookSignature } = require('./middleware/verifyMetaSignature');
+const WebhookRawLog = require('./models/WebhookRawLog');
+const webhookIngestionService = require('./services/WebhookIngestionService');
+const { processIncomingWebhookPayload } = require('./services/WebhookRouter');
 
 //  MongoDB Connection 
 if (process.env.MONGODB_URI) {
@@ -30,6 +34,10 @@ if (process.env.MONGODB_URI) {
             console.log(' MongoDB connected');
             // Seed panel packages into database table if missing
             await seedPanelPackages();
+            // Backfill reporting timezone for existing tenants
+            await backfillTenantReportingTimezones();
+            // Recover any pending/stuck webhook logs on boot
+            await webhookIngestionService.recoverPendingWebhookLogs();
             // Drop the old unique compound index on {tenantId, version} if it exists.
             // We now use a single-field unique index on {tenantId} since one doc per tenant.
             try {
@@ -82,6 +90,7 @@ const tenantSchema = new mongoose.Schema({
         tokenExpiry: { type: Date, default: null },   // null = never expires (system user token)
         tokenType: { type: String, default: 'user' }, // 'user' | 'system_user'
         tokenStatus: { type: String, default: 'active', enum: ['active', 'expiring_soon', 'expired', 'unknown'] },
+        reportingTimezone: { type: String, default: 'Asia/Kolkata' }, // WABA timezone for daily analytics reconciliation
     },
     webhookSecret: { type: String, default: '' },  // AES-256 encrypted hex string
     openaiApiKey: { type: String, default: '' },
@@ -95,6 +104,26 @@ const tenantSchema = new mongoose.Schema({
     status: { type: String, enum: ['active', 'inactive'], default: 'active' },
 }, { timestamps: true });
 const Tenant = mongoose.model('Tenant', tenantSchema);
+
+async function backfillTenantReportingTimezones() {
+    try {
+        const res = await Tenant.updateMany(
+            {
+                $or: [
+                    { 'whatsappConfig.reportingTimezone': { $exists: false } },
+                    { 'whatsappConfig.reportingTimezone': null },
+                    { 'whatsappConfig.reportingTimezone': '' }
+                ]
+            },
+            { $set: { 'whatsappConfig.reportingTimezone': 'Asia/Kolkata' } }
+        );
+        if (res.modifiedCount > 0) {
+            console.log(`[Startup] Backfilled reportingTimezone for ${res.modifiedCount} tenant(s) to 'Asia/Kolkata'`);
+        }
+    } catch (e) {
+        console.error('[Startup] Failed to backfill tenant reporting timezones:', e.message);
+    }
+}
 
 const clientSchema = new mongoose.Schema({
     tenantId: { type: String, required: true },
@@ -293,8 +322,11 @@ const recipientSchema = new mongoose.Schema({
 recipientSchema.index({ campaignId: 1, phaseNumber: 1 });
 recipientSchema.index({ campaignId: 1, status: 1 });
 recipientSchema.index({ campaignId: 1, phaseNumber: 1, status: 1, 'retryHistory.phaseNumber': 1 });
-// wamid already has unique:true which auto-creates an index — no need to re-declare
-recipientSchema.index({ tenantId: 1, to: 1, sentAt: -1 }, { sparse: true });   // fast Strategy-2 fallback button lookup
+recipientSchema.index({ wamid: 1, sentAt: 1 }, { sparse: true, background: true });
+recipientSchema.index({ wamid: 1, deliveredAt: 1 }, { sparse: true, background: true });
+recipientSchema.index({ wamid: 1, readAt: 1 }, { sparse: true, background: true });
+recipientSchema.index({ wamid: 1, failedAt: 1 }, { sparse: true, background: true });
+recipientSchema.index({ tenantId: 1, deliveryTimestamp: 1 }, { background: true });
 const Recipient = mongoose.model('Recipient', recipientSchema);
 
 const retryConfigurationSchema = new mongoose.Schema({
@@ -795,7 +827,12 @@ app.options(/.*/, cors(corsOptions));
 const httpServer = http.createServer(app);
 const io = new Server(httpServer, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 SocketEmitter.setIo(io);
-app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.json({
+    limit: '50mb',
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString();
+    }
+}));
 app.use(bodyParser.raw({
     type: (req) => {
         const contentType = req.headers['content-type'] || '';
@@ -1731,6 +1768,14 @@ app.post('/api/notifications/register-token', async (req, res) => {
             { upsert: true, new: true }
         );
 
+        // Deactivate or remove any old stale tokens for the same deviceId
+        if (deviceId) {
+            await FCMToken.deleteMany({
+                deviceId,
+                token: { $ne: token }
+            });
+        }
+
         // Subscribe device token to tenant FCM topic
         await FCMService.subscribeToTenantTopic(token, tenantId);
 
@@ -1803,6 +1848,21 @@ app.patch('/api/notifications/mark-all-read', async (req, res) => {
     } catch (err) {
         console.error('[Notifications API] Error marking all read:', err.message);
         res.status(500).json({ error: 'Failed to mark all read' });
+    }
+});
+
+// 5b. Clear/Delete all notifications for a tenant
+app.delete('/api/notifications/clear-all', async (req, res) => {
+    const tenantId = req.headers['tenant-id'] || req.query.tenantId || req.body?.tenantId;
+    const category = req.query.category || req.body?.category || null;
+    if (!tenantId) return res.status(400).json({ error: 'tenantId is required' });
+
+    try {
+        const result = await NotificationService.deleteAll(tenantId, category);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[Notifications API] Error clearing all notifications:', err.message);
+        res.status(500).json({ error: 'Failed to clear all notifications' });
     }
 });
 
@@ -6846,400 +6906,160 @@ async function handleLiveChat(tenantId, message, profileName, from) {
     }
 }
 
-//  Incoming Webhook (Messages & Status Updates) 
-app.post('/webhook', async (req, res) => {
-    const body = req.body;
-    console.log(' Incoming Webhook:', JSON.stringify(body, null, 2));
-
-    if (body.object !== 'whatsapp_business_account') return res.sendStatus(404);
-
-    // ── Step 3: Handle account_update PARTNER_ADDED event & message_template_status_update ──
-    for (const entry of body.entry || []) {
-        for (const change of entry.changes || []) {
-            const val = change.value;
-            if (change.field === 'account_update' && val?.event === 'PARTNER_ADDED') {
-                res.sendStatus(200); // Respond immediately to Meta
-                const wabaId = val.waba_id || entry.id;
-                const businessPortfolioId = val.business_portfolio_id || null;
-
+// Register handlers in WebhookIngestionService
+webhookIngestionService.setHandler(async (body, ctx) => {
+    return processIncomingWebhookPayload(body, {
+        processStatusUpdateAtomic: (statusUpdate) => messageTracker.processStatusUpdateAtomic(statusUpdate, {
+            Recipient,
+            StatusMapping,
+            Campaign,
+            Message,
+            broadcastMessages,
+            broadcastCampaigns,
+            messageTracker
+        }),
+        handlePartnerAdded: async (wabaId, val) => {
+            const businessPortfolioId = val?.business_portfolio_id || null;
+            await saveOnboardingLog({
+                tenantId: null,
+                sessionId: null,
+                wabaId,
+                businessPortfolioId,
+                step: 'WEBHOOK_PARTNER_ADDED',
+                status: 'info',
+                message: `Received account_update PARTNER_ADDED webhook from Meta. Triggering background onboarding...`,
+                details: val
+            });
+            processOnboarding(wabaId, businessPortfolioId, null).catch(async (err) => {
                 await saveOnboardingLog({
                     tenantId: null,
                     sessionId: null,
                     wabaId,
                     businessPortfolioId,
-                    step: 'WEBHOOK_PARTNER_ADDED',
-                    status: 'info',
-                    message: `Received account_update PARTNER_ADDED webhook from Meta. Triggering background onboarding...`,
-                    details: val
+                    step: 'WEBHOOK_PROCESS_ONBOARDING_FAIL',
+                    status: 'error',
+                    message: `Background onboarding triggered by webhook failed: ${err.message}`,
+                    details: err.stack
                 });
+            });
+        },
+        handleTemplateStatusUpdate: async (wabaId, val) => {
+            const templateName = val?.message_template_name;
+            const eventStatus = val?.event;
+            const reason = val?.reason || null;
+            const lang = val?.message_template_language || null;
+            console.log(`[Webhook] Template Status Update for WABA ${wabaId}: ${templateName} -> ${eventStatus} (Reason: ${reason})`);
 
-                // Trigger Steps 4→5→6 asynchronously (null tenantId = match by WABA ID)
-                processOnboarding(wabaId, businessPortfolioId, null).catch(async (err) => {
-                    await saveOnboardingLog({
-                        tenantId: null,
-                        sessionId: null,
-                        wabaId,
-                        businessPortfolioId,
-                        step: 'WEBHOOK_PROCESS_ONBOARDING_FAIL',
-                        status: 'error',
-                        message: `Background onboarding triggered by webhook failed: ${err.message}`,
-                        details: err.stack
-                    });
-                });
-                return; // already sent 200
-            }
-
-            if (change.field === 'message_template_status_update') {
-                res.sendStatus(200); // Respond immediately to Meta
-                const wabaId = entry.id;
-                const templateName = val?.message_template_name;
-                const eventStatus = val?.event; // APPROVED / REJECTED / PENDING / etc.
-                const reason = val?.reason || null;
-                const lang = val?.message_template_language || null;
-
-                console.log(`[Webhook] Template Status Update for WABA ${wabaId}: ${templateName} -> ${eventStatus} (Reason: ${reason})`);
-
-                Tenant.findOne({ 'whatsappConfig.businessAccountId': wabaId }).then(async (tenant) => {
-                    if (tenant) {
-                        const tenantId = tenant._id.toString();
-                        
-                        // Update our local cache of template rejection reasons if template was rejected
-                        if (eventStatus === 'REJECTED' && reason) {
-                            if (!tenant.whatsappConfig.templateRejections) {
-                                tenant.whatsappConfig.templateRejections = new Map();
-                            }
-                            tenant.whatsappConfig.templateRejections.set(templateName, reason);
-                            await tenant.save();
-                        } else if (eventStatus === 'APPROVED') {
-                            // If it's approved, we can remove any existing rejection reason
-                            if (tenant.whatsappConfig.templateRejections) {
-                                tenant.whatsappConfig.templateRejections.delete(templateName);
-                                await tenant.save();
-                            }
-                        }
-
-                        // Emit socket event to notify frontend
-                        io.to(tenantId).emit('template_status_update', {
-                            name: templateName,
-                            status: eventStatus,
-                            reason: reason,
-                            language: lang
-                        });
-                        console.log(`[Webhook] Emitted template_status_update to tenant ${tenantId}`);
-
-                        // Trigger In-App & FCM Push Notification
-                        try {
-                            const isApproved = eventStatus === 'APPROVED';
-                            await NotificationService.create({
-                                tenantId,
-                                title: isApproved ? '✅ Template Approved' : '❌ Template Rejected',
-                                body: isApproved 
-                                    ? `Template "${templateName}" was approved by Meta!`
-                                    : `Template "${templateName}" was rejected by Meta. Reason: ${reason || 'Policy violation'}`,
-                                type: 'system',
-                                category: 'system',
-                                actionData: { screen: 'templates' }
-                            });
-                        } catch (notifErr) {
-                            console.error('[Webhook] Failed to create template status notification:', notifErr.message);
-                        }
-                    } else {
-                        console.warn(`[Webhook] Received template status update for WABA ${wabaId} but no tenant found.`);
+            const tenant = await Tenant.findOne({ 'whatsappConfig.businessAccountId': wabaId });
+            if (tenant) {
+                const tenantId = tenant._id.toString();
+                if (eventStatus === 'REJECTED' && reason) {
+                    if (!tenant.whatsappConfig.templateRejections) tenant.whatsappConfig.templateRejections = new Map();
+                    tenant.whatsappConfig.templateRejections.set(templateName, reason);
+                    await tenant.save();
+                } else if (eventStatus === 'APPROVED') {
+                    if (tenant.whatsappConfig.templateRejections) {
+                        tenant.whatsappConfig.templateRejections.delete(templateName);
+                        await tenant.save();
                     }
-                }).catch(err => {
-                    console.error('[Webhook] Error handling template status update:', err);
+                }
+                io.to(tenantId).emit('template_status_update', {
+                    name: templateName,
+                    status: eventStatus,
+                    reason: reason,
+                    language: lang
                 });
-                return; // already sent 200
+                try {
+                    const isApproved = eventStatus === 'APPROVED';
+                    await NotificationService.create({
+                        tenantId,
+                        title: isApproved ? '✅ Template Approved' : '❌ Template Rejected',
+                        body: isApproved 
+                            ? `Template "${templateName}" was approved by Meta!`
+                            : `Template "${templateName}" was rejected by Meta. Reason: ${reason || 'Policy violation'}`,
+                        type: 'system',
+                        category: 'system',
+                        actionData: { screen: 'templates' }
+                    });
+                } catch (notifErr) {
+                    console.error('[Webhook] Failed to create template status notification:', notifErr.message);
+                }
             }
+        },
+        handlePhoneNumberNameUpdate: async (val) => {
+            const phoneNumberId = val?.display_phone_number_id || val?.phone_number_id;
+            const decision = val?.decision;
+            const requestedName = val?.requested_verified_name;
+            console.log(`[Webhook] phone_number_name_update for Phone ID ${phoneNumberId}: decision=${decision}, name=${requestedName}`);
 
-            if (change.field === 'phone_number_name_update') {
-                res.sendStatus(200); // Respond immediately to Meta
-                const phoneNumberId = val?.display_phone_number_id || val?.phone_number_id;
-                const decision = val?.decision; // APPROVED | DECLINED
-                const requestedName = val?.requested_verified_name;
-
-                console.log(`[Webhook] phone_number_name_update for Phone ID ${phoneNumberId}: decision=${decision}, name=${requestedName}`);
-
-                Tenant.findOne({ 'whatsappConfig.phoneNumberId': phoneNumberId }).then(async (tenant) => {
-                    if (tenant) {
-                        const tenantId = tenant._id.toString();
-                        const accessToken = tenant.whatsappConfig.accessToken;
-
+            const tenant = await Tenant.findOne({ 'whatsappConfig.phoneNumberId': phoneNumberId });
+            if (tenant) {
+                const tenantId = tenant._id.toString();
+                const accessToken = tenant.whatsappConfig.accessToken;
+                await Tenant.findByIdAndUpdate(tenantId, {
+                    $set: {
+                        'whatsappConfig.nameApprovalStatus': decision,
+                        'whatsappConfig.verifiedName': requestedName || tenant.whatsappConfig.verifiedName,
+                    }
+                });
+                if (decision === 'APPROVED' && accessToken) {
+                    const regResult = await registerPhoneNumber(phoneNumberId, accessToken, tenant.whatsappConfig.registrationPin || '123456');
+                    if (regResult.success) {
                         await Tenant.findByIdAndUpdate(tenantId, {
                             $set: {
-                                'whatsappConfig.nameApprovalStatus': decision,
-                                'whatsappConfig.verifiedName': requestedName || tenant.whatsappConfig.verifiedName,
+                                'whatsappConfig.phoneStatus': 'CONNECTED',
+                                'whatsappConfig.verified': true,
+                                'whatsappConfig.registrationError': null,
                             }
                         });
-
-                        if (decision === 'APPROVED' && accessToken) {
-                            console.log(`[Webhook] Display name APPROVED for Phone ID ${phoneNumberId}. Triggering auto-registration...`);
-                            const regResult = await registerPhoneNumber(phoneNumberId, accessToken, tenant.whatsappConfig.registrationPin || '123456');
-
-                            if (regResult.success) {
-                                await Tenant.findByIdAndUpdate(tenantId, {
-                                    $set: {
-                                        'whatsappConfig.phoneStatus': 'CONNECTED',
-                                        'whatsappConfig.verified': true,
-                                        'whatsappConfig.registrationError': null,
-                                    }
-                                });
-                                console.log(`[Webhook] ✅ Phone ID ${phoneNumberId} auto-registered and CONNECTED upon name approval.`);
-                            } else {
-                                await Tenant.findByIdAndUpdate(tenantId, {
-                                    $set: {
-                                        'whatsappConfig.registrationError': regResult.error,
-                                    }
-                                });
-                                console.error(`[Webhook] ❌ Phone ID ${phoneNumberId} auto-registration failed:`, regResult.error);
-                            }
-                        }
+                        console.log(`[Webhook] ✅ Phone ID ${phoneNumberId} auto-registered and CONNECTED upon name approval.`);
                     } else {
-                        console.warn(`[Webhook] Received phone_number_name_update for Phone ID ${phoneNumberId} but no tenant found.`);
-                    }
-                }).catch(err => {
-                    console.error('[Webhook] Error handling phone_number_name_update:', err);
-                });
-                return; // already sent 200
-            }
-        }
-    }
-
-    try {
-        const entry = body.entry[0];
-        const value = entry.changes[0].value;
-        const receiverPhoneNumberId = value.metadata?.phone_number_id;
-
-
-        // Handle Status Updates
-        if (value.statuses) {
-            const statusUpdate = value.statuses[0];
-            const wamid = statusUpdate.id;
-            const status = statusUpdate.status;
-            if (!wamid) return res.sendStatus(200);
-
-            console.log(JSON.stringify({
-                service: 'webhook',
-                event: 'delivery_status_received',
-                wamid,
-                status,
-                timestamp: new Date().toISOString()
-            }));
-
-            const mapping = await StatusMapping.findOne({ wamid });
-            if (mapping?.tenantId) {
-                // Update Message delivery status and details in DB
-                const messageUpdate = { status };
-                if (statusUpdate.errors && statusUpdate.errors.length > 0) {
-                    const err = statusUpdate.errors[0];
-                    messageUpdate.errorDetails = err.error_data?.details || err.message || err.title || 'Unknown Meta error';
-                }
-                await Message.findOneAndUpdate({ wamid }, { $set: messageUpdate });
-                await broadcastMessages(mapping.tenantId, mapping.to);
-
-                if (mapping.campaignId) {
-                    const filter = { tenantId: mapping.tenantId, id: mapping.campaignId };
-
-                    if (status === 'delivered') {
-                        await Campaign.findOneAndUpdate(filter, { $inc: { deliveredCount: 1 } });
-                    } else if (status === 'read') {
-                        // Meta sometimes sends 'read' without a prior 'delivered' webhook,
-                        // which would make deliveredCount go negative. Use an aggregation
-                        // pipeline update to clamp deliveredCount to 0 at minimum.
-                        await Campaign.findOneAndUpdate(filter, [
-                            {
-                                $set: {
-                                    readCount: { $add: ['$readCount', 1] },
-                                    deliveredCount: { $max: [0, { $subtract: ['$deliveredCount', 1] }] }
-                                }
+                        await Tenant.findByIdAndUpdate(tenantId, {
+                            $set: {
+                                'whatsappConfig.registrationError': regResult.error,
                             }
-                        ], { new: true });
-                    } else if (status === 'failed') {
-                        // Note: failureCount here = delivery failures (message failed AFTER being sent to Meta).
-                        // successCount is NOT decremented — it remains the API-acceptance count (how many
-                        // we submitted to Meta), matching the industry standard used by WATI and AiSensy.
-                        await Campaign.findOneAndUpdate(filter, { $inc: { failureCount: 1 } });
+                        });
+                        console.error(`[Webhook] ❌ Phone ID ${phoneNumberId} auto-registration failed:`, regResult.error);
                     }
-                }
-
-                if (mapping.campaignId) {
-                    const recipientUpdate = { status };
-                    if (status === 'delivered') recipientUpdate.deliveredAt = new Date().toISOString();
-                    if (status === 'read') recipientUpdate.readAt = new Date().toISOString();
-                    if (status === 'failed') recipientUpdate.failedAt = new Date().toISOString();
-                    await Recipient.findOneAndUpdate({ wamid }, { $set: recipientUpdate });
-
-                    // Phase tracking: record delivery phase for successfully delivered messages.
-                    // recordDelivery is idempotent — it only sets phaseNumber when it is still null,
-                    // so duplicate webhooks and delayed webhooks are handled safely.
-                    if (status === 'delivered' || status === 'read') {
-                        try {
-                            const campaign = await Campaign.findOne(
-                                { tenantId: mapping.tenantId, id: mapping.campaignId },
-                                { currentPhase: 1 }
-                            );
-                            if (campaign) {
-                                const deliveryTimestamp = statusUpdate.timestamp
-                                    ? new Date(parseInt(statusUpdate.timestamp, 10) * 1000)
-                                    : new Date();
-                                await messageTracker.recordDelivery(
-                                    wamid,
-                                    campaign.currentPhase,
-                                    deliveryTimestamp
-                                );
-                                console.log(JSON.stringify({
-                                    service: 'webhook',
-                                    event: 'delivery_phase_recorded',
-                                    wamid,
-                                    campaignId: mapping.campaignId,
-                                    phaseNumber: campaign.currentPhase,
-                                    deliveryStatus: status,
-                                    timestamp: new Date().toISOString()
-                                }));
-                            }
-                        } catch (trackErr) {
-                            // Non-fatal: log but don't fail the webhook response
-                            console.error(JSON.stringify({
-                                service: 'webhook',
-                                event: 'delivery_phase_record_failed',
-                                wamid,
-                                campaignId: mapping.campaignId,
-                                error: trackErr.message,
-                                stack: trackErr.stack,
-                                timestamp: new Date().toISOString()
-                            }));
-                        }
-                    }
-
-                    if (status === 'delivered' || status === 'read') {
-                        try {
-                            const remainingUndelivered = await Recipient.countDocuments({
-                                campaignId: mapping.campaignId,
-                                status: { $nin: ['delivered', 'read'] }
-                            });
-                            if (remainingUndelivered === 0) {
-                                await campaignLifecycleManager.completeCampaign(mapping.campaignId, mapping.tenantId);
-                            }
-                        } catch (autoCompErr) {
-                            console.warn('[webhook] auto completeCampaign check error:', autoCompErr.message);
-                        }
-                    }
-
-                    await broadcastCampaigns(mapping.tenantId);
                 }
             }
-        }
-
-        // Handle Incoming Messages
-        if (value.messages) {
+        },
+        processIncomingMessage: async (message, contacts, receiverPhoneNumberId) => {
             let tenantId = null;
             let tenant = null;
             if (receiverPhoneNumberId) {
                 tenant = await Tenant.findOne({ 'whatsappConfig.phoneNumberId': receiverPhoneNumberId });
                 if (tenant) tenantId = tenant._id.toString();
             }
-
             if (!tenantId) {
                 console.warn(` Could not map incoming message to a tenant (Phone: ${receiverPhoneNumberId})`);
             } else {
-                const message = value.messages[0];
                 const from = message.from;
-                const profileName = value.contacts?.[0]?.profile?.name || 'Unknown Sender';
-
-                // ── Campaign Button Click Tracking ──────────────────────────────
-                // When a contact taps a quick-reply button on a campaign template,
-                // Meta sends an interactive button_reply message. We persist that
-                // click on the Recipient record for that specific campaign message.
-                // ── Handles BOTH Meta button reply formats: ──────────────────────────
-                //   1. message.type === 'interactive', interactive.type === 'button_reply'
-                //      → New Cloud API format for interactive quick-reply buttons
-                //   2. message.type === 'button', message.button.text
-                //      → Legacy format Meta sends for template quick-reply button taps
-                const isInteractiveButtonReply =
-                    message.type === 'interactive' && message.interactive?.type === 'button_reply';
-                const isLegacyButtonReply =
-                    message.type === 'button' && (message.button?.text || message.button?.payload);
-
-                if (isInteractiveButtonReply || isLegacyButtonReply) {
-                    try {
-                        const buttonText = isInteractiveButtonReply
-                            ? (message.interactive.button_reply?.title || '')
-                            : (message.button?.text || message.button?.payload || '');
-                        const buttonId = isInteractiveButtonReply
-                            ? (message.interactive.button_reply?.id || '')
-                            : (message.button?.payload || '');
-                        // context.id = wamid of the original sent template message (exact match)
-                        const contextWamid = message.context?.id || null;
-
-                        if (buttonText) {
-                            let recipient = null;
-
-                            // Strategy 1: Exact match by the original message's wamid (most accurate)
-                            if (contextWamid) {
-                                recipient = await Recipient.findOne({ wamid: contextWamid });
-                            }
-
-                            // Strategy 2: Fallback — most recent campaign Recipient for this phone
-                            // Limit to last 7 days to avoid attributing to a wrong older campaign
-                            if (!recipient) {
-                                const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-                                recipient = await Recipient.findOne(
-                                    {
-                                        tenantId,
-                                        to: from,
-                                        campaignId: { $ne: null, $exists: true },
-                                        sentAt: { $gte: sevenDaysAgo.toISOString() }
-                                    },
-                                    null,
-                                    { sort: { sentAt: -1 } }
-                                );
-                            }
-
-                            if (recipient) {
-                                await Recipient.findByIdAndUpdate(recipient._id, {
-                                    $addToSet: { clickedButtons: buttonText },
-                                    $push: {
-                                        buttonClicks: {
-                                            buttonText,
-                                            buttonId,
-                                            clickedAt: new Date()
-                                        }
-                                    }
-                                });
-
-                                console.log(JSON.stringify({
-                                    service: 'webhook',
-                                    event: 'campaign_button_clicked',
-                                    tenantId,
-                                    from,
-                                    campaignId: recipient.campaignId,
-                                    buttonText,
-                                    buttonId,
-                                    messageType: message.type,
-                                    matchedBy: contextWamid ? 'context_wamid' : 'phone_fallback',
-                                    timestamp: new Date().toISOString()
-                                }));
-
-                                await broadcastCampaigns(tenantId);
-                            } else {
-                                console.log(`[Webhook] button click from ${from} (type=${message.type}) — no matching campaign recipient found within last 7 days`);
-                            }
-                        }
-                    } catch (btnErr) {
-                        // Non-fatal — log and continue to chatbot processing
-                        console.error('[Webhook] Campaign button click tracking error:', btnErr.message);
-                    }
-                }
-                // ── End Campaign Button Click Tracking ──────────────────────────
-
+                const profileName = contacts?.[0]?.profile?.name || 'Unknown Sender';
                 await chatbotEngineProcessMessage(tenantId, message, profileName, from, tenant);
             }
         }
+    });
+});
 
-        res.sendStatus(200);
-    } catch (error) {
-        console.error(' Error processing webhook:', error);
-        res.sendStatus(500);
+//  Incoming Webhook (Messages & Status Updates) 
+app.post('/webhook', verifyMetaWebhookSignature, async (req, res) => {
+    const body = req.body;
+    if (body.object !== 'whatsapp_business_account') return res.sendStatus(404);
+
+    let rawLogId = null;
+    try {
+        rawLogId = await webhookIngestionService.enqueueRawWebhook(body);
+    } catch (err) {
+        console.error('[Webhook] Failed to write-ahead enqueue raw webhook:', err.message);
+    }
+
+    // Immediate acknowledgment within SLA (< 50ms)
+    res.status(200).send('EVENT_RECEIVED');
+
+    // Process asynchronously in background
+    if (rawLogId) {
+        setImmediate(() => webhookIngestionService.processWebhookJob(rawLogId));
     }
 });
 
